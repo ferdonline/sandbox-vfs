@@ -1,102 +1,28 @@
 //! This libc backend is for supporting inter-positioning of processes
 //! It should not be used in other contexts
 
-use std::ffi::{c_int, c_char, CString};
+#![allow(unused)]
 
-use crate::FileSystem;
+use super::dlhooks;
+use std::ffi::{c_char, c_int};
 
-#[derive(Debug)]
-pub struct LibcBackend;
-
-impl LibcBackend {}
-
-impl FileSystem for LibcBackend {
-    fn read_dir(&self, _path: &str) -> crate::VfsResult<Box<dyn Iterator<Item = String> + Send>> {
-        todo!()
-    }
-
-    fn create_dir(&self, _path: &str) -> crate::VfsResult<()> {
-        todo!()
-    }
-
-    fn open_file(&self, _path: &str) -> crate::VfsResult<Box<dyn crate::SeekAndRead + Send>> {
-        todo!()
-    }
-
-    fn create_file(&self, _path: &str) -> crate::VfsResult<Box<dyn crate::SeekAndWrite + Send>> {
-        todo!()
-    }
-
-    fn append_file(&self, _path: &str) -> crate::VfsResult<Box<dyn crate::SeekAndWrite + Send>> {
-        todo!()
-    }
-
-    fn metadata(&self, _path: &str) -> crate::VfsResult<crate::VfsMetadata> {
-        todo!()
-    }
-
-    fn exists(&self, _path: &str) -> crate::VfsResult<bool> {
-        todo!()
-    }
-
-    fn remove_file(&self, _path: &str) -> crate::VfsResult<()> {
-        todo!()
-    }
-
-    fn remove_dir(&self, _path: &str) -> crate::VfsResult<()> {
-        todo!()
-    }
-
-    fn set_creation_time(&self, _path: &str, _time: std::time::SystemTime) -> crate::VfsResult<()> {
-        Err(crate::VfsError::from(crate::error::VfsErrorKind::NotSupported))
-    }
-
-    fn set_modification_time(&self, _path: &str, _time: std::time::SystemTime) -> crate::VfsResult<()> {
-        Err(crate::VfsError::from(crate::error::VfsErrorKind::NotSupported))
-    }
-
-    fn set_access_time(&self, _path: &str, _time: std::time::SystemTime) -> crate::VfsResult<()> {
-        Err(crate::VfsError::from(crate::error::VfsErrorKind::NotSupported))
-    }
-
-    fn copy_file(&self, _src: &str, _dest: &str) -> crate::VfsResult<()> {
-        Err(crate::error::VfsErrorKind::NotSupported.into())
-    }
-
-    fn move_file(&self, _src: &str, _dest: &str) -> crate::VfsResult<()> {
-        Err(crate::error::VfsErrorKind::NotSupported.into())
-    }
-
-    fn move_dir(&self, _src: &str, _dest: &str) -> crate::VfsResult<()> {
-        Err(crate::error::VfsErrorKind::NotSupported.into())
-    }
-
-    fn _access(&self, path: &str, mode: i32) -> i32 {
-        let c_path = CString::new(path).unwrap();
-        unsafe { access.get()(c_path.as_ptr(), mode) }
-    }
-
-}
-
-// hooks
-
-redhook::hook!{
-    unsafe fn accessat(_dirfd: c_int, _pathname: *const c_char, _mode: c_int, _flags: c_int) -> c_int => faccess_wrapper {
+dlhooks::hook! {
+    unsafe fn accessat(_dirfd: c_int, _pathname: *const c_char, _mode: c_int, _flags: c_int) -> c_int => {
         42
     }
 }
-redhook::hook!{
-    unsafe fn access(_path: *const c_char, _amode: c_int) -> c_int => access_wrapper {
+dlhooks::hook! {
+    unsafe fn access(_path: *const c_char, _amode: c_int) -> c_int => {
         42
     }
 }
-redhook::hook!{
-    unsafe fn open(_cpath: *const c_char, _oflag: c_int) -> c_int => open_wrapper {
+dlhooks::hook! {
+    unsafe fn open(_cpath: *const c_char, _oflag: c_int) -> c_int => {
         42
     }
 }
-redhook::hook!{
-    unsafe fn openat(_dirfd: c_int, _cpath: *const c_char, _oflag: c_int) -> c_int => openat_wrapper {
+dlhooks::hook! {
+    unsafe fn openat(_dirfd: c_int, _cpath: *const c_char, _oflag: c_int) -> c_int => {
         42
     }
 }

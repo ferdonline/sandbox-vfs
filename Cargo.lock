@@ -6,20 +6,11 @@ version = 3
 name = "interceptor-vfs"
 version = "0.0.1"
 dependencies = [
- "redhook",
+ "libc",
 ]
 
 [[package]]
 name = "libc"
-version = "0.2.149"
+version = "0.2.173"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a08173bc88b7955d1b3145aa561539096c421ac8debde8cbc3612ec635fee29b"
-
-[[package]]
-name = "redhook"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6e109b8469dbbe6d7cbe18e5ebd65d4a134e2f4b91304ad9213984cad1d70a6"
-dependencies = [
- "libc",
-]
+checksum = "d8cfeafaffdbc32176b64fb251369d52ea9f0a8fbc6f8759edffef7b525d64bb"
