@@ -6,7 +6,7 @@
 //! The main interaction with the virtual filesystem is by using virtual paths ([`VfsPath`](path/struct.VfsPath.html)).
 //!
 //! This crate currently has the following implementations:
-
+#![feature(c_variadic)]
 pub mod filesystem;
 pub mod impls;
 pub mod libc_hooks;
@@ -17,3 +17,4 @@ pub mod dlhooks;
 pub use impls::bindfs::BindFS;
 pub use impls::memory::MemoryFS;
 pub use impls::overlay::OverlayFS;
+pub use impls::{AsCStr, FromCStr};

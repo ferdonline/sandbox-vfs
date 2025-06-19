@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use libc::mode_t;
+
 use crate::filesystem::LowLevelFS;
 
 #[derive(Debug)]
@@ -26,8 +28,9 @@ impl RootVFS {
     }
 
     // For now use well defined mount points, without trailing slash
-    pub fn mount(&mut self, mount_p: impl Into<PathBuf>, fs: Box<dyn LowLevelFS>) {
+    pub fn with_mount(mut self, mount_p: impl Into<PathBuf>, fs: Box<dyn LowLevelFS>) -> Self {
         self.mounts.insert(mount_p.into(), fs);
+        self
     }
 
     /// Find the actual filesystem and respective underlying path
@@ -57,19 +60,24 @@ impl LowLevelFS for RootVFS {
         fs.access(&path, mode)
     }
 
-    fn open(&self, path: &Path, mode: i32) -> i32 {
+    fn open(&self, path: &Path, oflag: i32, mode: mode_t) -> i32 {
         let (fs, path) = self.path_to_fs(path);
-        fs.open(&path, mode)
+        fs.open(&path, oflag, mode)
     }
 
-    fn mkdir(&self, path: &Path, mode: i32) -> i32 {
+    fn mkdir(&self, path: &Path, mode: mode_t) -> i32 {
         let (fs, path) = self.path_to_fs(path);
         fs.mkdir(&path, mode)
     }
 
-    fn chmod(&self, path: &Path, mode: i32) -> i32 {
+    fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
         let (fs, path) = self.path_to_fs(path);
         fs.chmod(&path, mode)
+    }
+
+    fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
+        let (fs, path) = self.path_to_fs(path);
+        fs.openat(dirfd, &path, flag, mode)
     }
 }
 
@@ -82,8 +90,7 @@ mod test {
 
     #[test]
     fn test_mount_redirect() {
-        let mut root = RootVFS::new(Box::new(MemoryFS::new("root")));
-        root.mount("/mnt", Box::new(MemoryFS::new("mnt")));
+        let root = RootVFS::new(MemoryFS::new("root")).with_mount("/mnt", MemoryFS::new("mnt"));
 
         let (fs1, p1) = root.path_to_fs(Path::new("/usr/bin"));
         assert_eq!(fs1.id(), "root");

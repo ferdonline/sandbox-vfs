@@ -32,7 +32,7 @@ macro_rules! hook {
                 $body
             }
 
-            pub fn orig() -> unsafe extern fn ( $($v : $t),* ) -> $r {
+            pub fn orig() -> unsafe extern "C" fn ( $($v : $t),* ) -> $r {
                 use ::std::sync::Once;
                 static mut REAL: *const u8 = 0 as *const u8;
                 static mut ONCE: Once = Once::new();
@@ -45,8 +45,12 @@ macro_rules! hook {
                 }
             }
 
+            pub fn call_orig( $($v : $t),* ) -> $r {
+                unsafe { Self::orig()( $($v),* ) }
+            }
+
             #[no_mangle]
-            pub unsafe extern fn $real_fn ( $($v : $t),* ) -> $r {
+            pub unsafe extern "C" fn $real_fn ( $($v : $t),* ) -> $r {
                 ::std::panic::catch_unwind(|| Self::hook( $($v),* )).unwrap_or_else(|_| Self::orig() ( $($v),* ))
             }
         }

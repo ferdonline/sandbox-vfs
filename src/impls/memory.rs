@@ -2,21 +2,31 @@
 //! It uses memfd_create to have real file descriptors. Among
 //! others, they track creation and modification times
 
+#![allow(unused)] // TODO: Remove this
+
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hasher},
     os::unix::{ffi::OsStrExt, io::RawFd},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, RwLock},
 };
 
-use libc::*;
+// use append_only_vec::AppendOnlyVec;
+
+use libc::{c_void, dirent, mode_t, syscall, SYS_memfd_create};
 
 use crate::filesystem::LowLevelFS;
+
+// We need to keep track of all MemFS due to intercepting calls with virtual fd's
+// pub static ALL_MEM_FS: AppendOnlyVec<&MemoryFS> = AppendOnlyVec::new();
 
 #[derive(Debug)]
 pub struct MemoryFS {
     id: String,
+    base_fd: usize,
+    cur_dir_fd: usize,
     fs: RwLock<HashMap<PathBuf, Arc<MemFsEntry>>>,
 }
 
@@ -54,11 +64,23 @@ impl MemFsEntry {
 }
 
 impl MemoryFS {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self {
+    pub fn new(id: impl Into<String>) -> Box<Self> {
+        // let base_fd = ALL_MEM_FS.len() * super::MEMORY_FD_START;
+        let memfs = Box::new(Self {
             id: id.into(),
+            base_fd: 0,
+            cur_dir_fd: 0,
             fs: RwLock::new(HashMap::new()),
-        }
+        });
+        // Hack: In order to avoid changing API everywhere to support a non-case, we keep static refs to the created mem filesystems
+        // This is fine as long as we agree that filesystems are only destroyed at the end
+        // ALL_MEM_FS.push(unsafe { std::mem::transmute(memfs.as_ref()) });
+        memfs
+    }
+
+    // This intercepted call is unique to memory-fs
+    pub fn getdents64(&self, fd: i32, dirp: *mut c_void, count: i32) -> isize {
+        todo!()
     }
 }
 
@@ -75,7 +97,7 @@ impl LowLevelFS for MemoryFS {
         }
     }
 
-    fn open(&self, path: &std::path::Path, _mode: i32) -> RawFd {
+    fn open(&self, path: &std::path::Path, _oflag: i32, _mode: mode_t) -> RawFd {
         if let Some(memfile) = self.fs.read().unwrap().get(path) {
             return memfile.fd;
         }
@@ -83,7 +105,7 @@ impl LowLevelFS for MemoryFS {
     }
 
     // Function to create a directory (mkdir)
-    fn mkdir(&self, path: &Path, _mode: i32) -> RawFd {
+    fn mkdir(&self, path: &Path, _mode: mode_t) -> RawFd {
         let parent = path.parent().unwrap();
         let parent_hash = calculate_hash_seq(parent.as_os_str().as_bytes());
         let name = format!(
@@ -104,8 +126,12 @@ impl LowLevelFS for MemoryFS {
         return 0; // success
     }
 
-    fn chmod(&self, _path: &Path, _mode: i32) -> i32 {
+    fn chmod(&self, _path: &Path, _mode: mode_t) -> i32 {
         return 0; // success
+    }
+
+    fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
+        todo!()
     }
 }
 
@@ -119,6 +145,8 @@ fn calculate_hash_seq<T: std::hash::Hash>(t: &[T]) -> u64 {
 
 #[cfg(test)]
 mod test {
+    use libc::F_OK;
+
     use super::*;
 
     #[test]

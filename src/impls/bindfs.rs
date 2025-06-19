@@ -1,6 +1,9 @@
 //! A file system with its root in a particular directory of another filesystem
 #![allow(unused)]
 
+use super::AsCStr;
+use libc::{c_char, mode_t};
+
 use crate::{filesystem::LowLevelFS, libc_hooks};
 
 use std::{
@@ -34,7 +37,11 @@ impl BindFS {
     fn translate_path(&self, pth: impl AsRef<Path>) -> PathBuf {
         let mut components = pth.as_ref().components();
         assert_eq!(components.next().unwrap(), Component::RootDir);
-        self.root.join(components.as_path())
+        let mut pth = self.root.join(components.as_path());
+        if !pth.as_os_str().as_bytes().last().is_some_and(|l| *l == 0) {
+            pth.as_mut_os_string().push("\0");
+        }
+        pth
     }
 }
 
@@ -43,23 +50,30 @@ impl LowLevelFS for BindFS {
         &self.id
     }
 
-    fn access(&self, p: &Path, mode: i32) -> i32 {
-        let final_path = self.translate_path(p);
-        let path_ptr = final_path.as_os_str().as_bytes().as_ptr();
-        unsafe { libc_hooks::access::orig()(path_ptr as *const i8, mode) }
+    fn access(&self, pth: &Path, mode: i32) -> i32 {
+        let final_path = self.translate_path(pth);
+        println!("  -> REAL access to {final_path:?}, o{mode:o}");
+        unsafe { libc_hooks::access::call_orig(final_path.as_cstr(), mode) }
     }
 
-    fn open(&self, p: &Path, mode: i32) -> i32 {
-        let final_path = self.translate_path(p);
-        let path_ptr = final_path.as_os_str().as_bytes().as_ptr();
-        unsafe { libc_hooks::open::orig()(path_ptr as *const i8, mode) }
+    fn open(&self, pth: &Path, oflag: i32, mode: mode_t) -> i32 {
+        let final_path = self.translate_path(pth);
+        println!("  -> REAL open to {final_path:?}, o{mode:o}");
+        unsafe { libc_hooks::Open::call_orig(final_path.as_cstr(), oflag, mode) }
     }
 
-    fn mkdir(&self, _path: &Path, _mode: i32) -> i32 {
-        todo!()
+    fn mkdir(&self, pth: &Path, mode: mode_t) -> i32 {
+        let final_path = self.translate_path(pth);
+        println!("  -> REAL mkdir to {final_path:?}, o{mode:o}");
+        unsafe { libc_hooks::mkdir::call_orig(final_path.as_cstr(), mode) }
     }
 
-    fn chmod(&self, _path: &Path, _mode: i32) -> i32 {
+    fn chmod(&self, pth: &Path, mode: mode_t) -> i32 {
+        let final_path = self.translate_path(pth);
+        unsafe { libc_hooks::chmod::call_orig(final_path.as_cstr(), mode) }
+    }
+
+    fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
         todo!()
     }
 }

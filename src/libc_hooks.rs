@@ -3,34 +3,201 @@
 
 #![allow(unused)]
 
+use libc::{c_char, c_int, c_void, gid_t, mode_t, size_t, uid_t};
+
 use super::dlhooks;
-use std::ffi::{c_char, c_int};
+use crate::filesystem::LowLevelFS;
+use crate::root_vfs::RootVFS;
+use crate::{libc_hooks, BindFS, FromCStr, OverlayFS};
+
+// use crate::impls::memory::ALL_MEM_FS;
+
+use core::ffi::va_list;
+use std::path::Path;
+use std::sync::{LazyLock, Once};
+
+static VFS: LazyLock<RootVFS> = LazyLock::new(|| {
+    // Paths relative to crate dir
+    let root_path = Path::new(file!())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("fakefs")
+        .canonicalize()
+        .unwrap();
+    let overlay_rw = Path::new(file!())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("overlay_rw")
+        .canonicalize()
+        .unwrap();
+    // RootVFS::new(Box::new(BindFS::new("fakefs", root_path)))
+
+    RootVFS::new(Box::new(OverlayFS::new(
+        "overlay",
+        Box::new(BindFS::new("overlay_rw", overlay_rw)),
+        Box::new(BindFS::new("fakefs", root_path)),
+    )))
+});
 
 dlhooks::hook! {
-    unsafe fn accessat(_dirfd: c_int, _pathname: *const c_char, _mode: c_int, _flags: c_int) -> c_int => {
-        42
+    unsafe fn accessat(dirfd: c_int, cpath: *const c_char, mode: c_int, flags: c_int) -> c_int => {
+        #[cfg(test)]
+        libc::printf(b"> Intercepted accessat with params: %d %s %d\0".as_ptr() as *const c_char, dirfd, cpath, mode);
+        Self::call_orig(dirfd, cpath, mode, flags)
     }
 }
 dlhooks::hook! {
-    unsafe fn access(_path: *const c_char, _amode: c_int) -> c_int => {
-        42
+    unsafe fn access(cpath: *const c_char, mode: c_int) -> c_int => {
+        #[cfg(test)]
+        libc::printf(b"> Intercepted with params:%s %d\0".as_ptr() as *const c_char, cpath, mode);
+        Self::call_orig(cpath, mode)
     }
 }
 dlhooks::hook! {
-    unsafe fn open(_cpath: *const c_char, _oflag: c_int) -> c_int => {
-        42
+    unsafe fn chmod(path: *const c_char, mode: mode_t) -> c_int => {
+        VFS.chmod(Path::from_cstr(path), mode)
     }
 }
 dlhooks::hook! {
-    unsafe fn openat(_dirfd: c_int, _cpath: *const c_char, _oflag: c_int) -> c_int => {
-        42
+    unsafe fn fchownat(dirfd: c_int, cpath: *const c_char, uid: uid_t, gid: gid_t, flags: c_int) -> c_int => {
+        #[cfg(test)]
+        libc::printf(b"> Intercepted fchownat with params: %d %s %d %d %d\0".as_ptr() as *const c_char, dirfd, cpath, uid, gid, flags);
+        Self::call_orig(dirfd, cpath, uid, gid, flags)
+    }
+}
+dlhooks::hook! {
+    unsafe fn lchown(path: *const c_char, uid: uid_t, gid: gid_t) -> c_int => {
+        Self::call_orig(path, uid, gid)
+    }
+}
+dlhooks::hook! {
+    unsafe fn creat(path: *const c_char, mode: mode_t) -> c_int => {
+        Self::call_orig(path, mode)
+    }
+}
+dlhooks::hook! {
+    unsafe fn mkdir(path: *const c_char, mode: mode_t) -> c_int => {
+        VFS.mkdir(Path::from_cstr(path), mode)
+    }
+}
+dlhooks::hook! {
+    unsafe fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: mode_t) -> c_int => {
+        #[cfg(test)]
+        libc::printf(b"> Intercepted mkdirat with params: %d %s %d\0".as_ptr() as *const c_char, dirfd, pathname, mode as i32);
+        Self::call_orig(dirfd, pathname, mode)
+    }
+}
+dlhooks::hook! {
+    unsafe fn getdents64(fd: c_int, dirp: *mut c_void, count: c_int) -> isize => {
+        // We need to intercept this one operating on fd because the memory backend is not a real one
+        let memfs_id = fd / 10000;
+        // if memfs_id > 0 {
+        //     ALL_MEM_FS[memfs_id as usize - 1].getdents64(fd, dirp, count)
+        // }
+        // else {
+            Self::call_orig(fd, dirp, count)
+        // }
     }
 }
 
-// fchownat(dirfd: c_int, pathname: *const c_char, owner: crate::uid_t, group: crate::gid_t, flags: c_int) -> c_int
-// lchown(path: *const c_char, uid: uid_t, gid: gid_t) -> c_int
+// NOTE: variadic arg functions are a bit pain since rust macros don't handle ...
+// We create manually
+#[no_mangle]
+pub unsafe extern "C" fn open(cpath: *const c_char, oflag: c_int, mut va_args: ...) -> i32 {
+    let mode = match oflag & (libc::O_CREAT | libc::O_TMPFILE) {
+        0 => 0,
+        _ => va_args.arg(),
+    };
+    unsafe {
+        libc::printf(
+            b"> Intercepted open with params: %s %d\n\0".as_ptr() as *const c_char,
+            cpath,
+            oflag as i32,
+        );
+    }
+    VFS.open(Path::from_cstr(cpath), oflag, mode)
+}
 
-// creat(path: *const c_char, mode: mode_t) -> c_int,
+pub struct Open;
+impl Open {
+    pub fn call_orig(cpath: *const c_char, oflag: c_int, mode: mode_t) -> i32 {
+        use ::std::sync::Once;
+        static mut REAL: *const u8 = 0 as *const u8;
+        static mut ONCE: Once = Once::new();
+        let fn_ptr: fn(_, _, _) -> i32 = unsafe {
+            ONCE.call_once(|| {
+                REAL = crate::dlhooks::dlsym_next("open\0");
+            });
+            ::std::mem::transmute(REAL)
+        };
+        (fn_ptr)(cpath, oflag, mode)
+    }
+}
+
+// NOTE: variadic arg functions are a bit pain since rust macros don't handle ...
+// We create manually
+#[no_mangle]
+pub unsafe extern "C" fn openat(
+    dirfd: c_int,
+    cpath: *const c_char,
+    oflag: c_int,
+    mut va_args: ...
+) -> c_int {
+    let mode = match oflag & (libc::O_CREAT | libc::O_TMPFILE) {
+        0 => 0,
+        _ => va_args.arg(),
+    };
+    unsafe {
+        libc::printf(
+            b"> Intercepted openAt with params: %d %s %d\n\0".as_ptr() as *const c_char,
+            dirfd,
+            cpath,
+            oflag as i32,
+        );
+    }
+
+    let addr = libc::dlsym(libc::RTLD_NEXT, b"openat\0".as_ptr() as *const c_char);
+    if !addr.is_null() {
+        let fn_ptr: fn(_, _, _, _) -> i32 = unsafe { ::std::mem::transmute(addr) };
+        (fn_ptr)(dirfd, cpath, oflag, mode)
+    } else {
+        eprintln!("Failed to load real openat");
+        -1
+    }
+}
+
+// NOTE: variadic arg functions are a bit pain since rust macros don't handle ...
+// We create manually
+#[no_mangle]
+pub unsafe extern "C" fn open64(cpath: *const c_char, oflag: c_int, mut va_args: ...) -> i32 {
+    let mode = match oflag & (libc::O_CREAT | libc::O_TMPFILE) {
+        0 => 0,
+        _ => va_args.arg(),
+    };
+    unsafe {
+        libc::printf(
+            b"> Intercepted open64 with params: %s %d\n\0".as_ptr() as *const c_char,
+            cpath,
+            oflag as i32,
+        );
+    }
+    VFS.open(Path::from_cstr(cpath), oflag, mode)
+}
+
+// dlhooks::hook! {
+//     unsafe fn readlink(path: *const c_char, buf: *mut c_char, bufsiz: size_t) -> c_int => {
+//         Self::call_orig(path, buf, bufsiz)
+//     }
+// }
+// dlhooks::hook! {
+//     unsafe fn readlinkat(dirfd: c_int, pathname: *const c_char, buf: *mut c_char, bufsiz: size_t) -> c_int => {
+//         Self::call_orig(dirfd, pathname, buf, bufsiz)
+//     }
+// }
 
 // execl(path: *const c_char, arg0: *const c_char, ...) -> c_int,
 // execle(path: *const c_char, arg0: *const c_char, ...) -> c_int,
@@ -41,23 +208,12 @@ dlhooks::hook! {
 
 // link(src: *const c_char, dst: *const c_char) -> c_int,
 
-// mkdir(path: *const c_char, mode: mode_t) -> c_int,
-// mkdirat(dirfd: c_int, pathname: *const c_char, mode: mode_t) -> c_int,
-
 // mkfifo(path: *const c_char, mode: mode_t) -> c_int,
 
 // mknod(pathname: *const c_char, mode: mode_t, dev: crate::dev_t) -> c_int,
 // mknodat(dirfd: c_int, pathname: *const c_char, mode: mode_t, dev: dev_t) -> c_int,
 
 // pathconf(path: *const c_char, name: c_int) -> c_long,
-
-// readlink(path: *const c_char, buf: *mut c_char, bufsz: size_t) -> c_int,
-// readlinkat(
-//     dirfd: c_int,
-//     pathname: *const c_char,
-//     buf: *mut c_char,
-//     bufsiz: size_t,
-// ) -> c_int
 
 // realpath(pathname: *const c_char, resolved: *mut c_char) -> *mut c_char,
 
