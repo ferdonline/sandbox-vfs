@@ -1,8 +1,8 @@
 [package]
-name = "interceptor-vfs"
+name = "sandbox-vfs"
 version = "0.0.1"
-authors = ["Fernando Pereira <fernando.pereira@hadean.com>"]
-description = "A libc interceptor virtual filesystem for Rust"
+authors = ["Fernando Pereira <ferdonline@gmail.com>"]
+description = "A libc-interposed virtual filesystem for Rust"
 readme = "README.md"
 keywords = ["vfs", "virtual", "filesystem"]
 license = "Apache-2.0"

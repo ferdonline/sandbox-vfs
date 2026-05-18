@@ -4,18 +4,19 @@
 
 #![allow(unused)] // TODO: Remove this
 
+#[cfg(not(target_os = "linux"))]
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hasher},
     os::unix::{ffi::OsStrExt, io::RawFd},
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{Arc, RwLock},
 };
 
 // use append_only_vec::AppendOnlyVec;
 
-use libc::{c_void, dirent, mode_t, syscall, SYS_memfd_create};
+use libc::{c_void, mode_t};
 
 use crate::filesystem::LowLevelFS;
 
@@ -53,8 +54,18 @@ pub enum FileKind {
 }
 
 /// Created a memfd entry given it's NULL TERMINATED name
+#[cfg(target_os = "linux")]
 fn create_memfd(name: &[u8]) -> RawFd {
+    use libc::{syscall, SYS_memfd_create};
+
     unsafe { syscall(SYS_memfd_create, name.as_ptr() as *const i8, 0) as RawFd }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_memfd(_name: &[u8]) -> RawFd {
+    static NEXT_FD: AtomicI32 = AtomicI32::new(10_000);
+
+    NEXT_FD.fetch_add(1, Ordering::Relaxed)
 }
 
 impl MemFsEntry {

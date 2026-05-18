@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use libc::{mode_t, F_OK, O_APPEND, O_RDWR, O_WRONLY};
+use libc::{mode_t, F_OK, O_APPEND, O_CREAT, O_RDWR, O_TRUNC, O_WRONLY};
 
 use crate::filesystem::LowLevelFS;
 
@@ -40,6 +40,47 @@ impl OverlayFS {
     pub fn base_layer(&self) -> &dyn LowLevelFS {
         self.base.as_ref()
     }
+
+    fn visible_layer(&self, path: &Path) -> &dyn LowLevelFS {
+        if self.top.access(path, F_OK) == 0 {
+            return self.top.as_ref();
+        }
+        if let Some(middle) = &self.middle {
+            if middle.access(path, F_OK) == 0 {
+                return middle.as_ref();
+            }
+        }
+        self.base.as_ref()
+    }
+
+    fn path_exists_below_top(&self, path: &Path) -> bool {
+        self.middle
+            .as_ref()
+            .is_some_and(|fs| fs.access(path, F_OK) == 0)
+            || self.base.access(path, F_OK) == 0
+    }
+
+    fn ensure_top_parent_dirs(&self, path: &Path) {
+        let Some(parent_dir) = path.parent() else {
+            return;
+        };
+
+        if self.top.access(parent_dir, F_OK) == 0 || !self.path_exists_below_top(parent_dir) {
+            return;
+        }
+
+        for p in parent_dir
+            .ancestors()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .filter(|p| *p != Path::new("/"))
+        {
+            if self.top.access(p, F_OK) != 0 {
+                self.top.mkdir(p, 0o755);
+            }
+        }
+    }
 }
 
 impl LowLevelFS for OverlayFS {
@@ -48,67 +89,26 @@ impl LowLevelFS for OverlayFS {
     }
 
     fn access(&self, path: &Path, mode: i32) -> i32 {
-        // Exists is upper layer? Use it
-        if self.top.access(path, F_OK) == 0 {
-            return match mode == F_OK {
-                true => 0,
-                false => self.top.access(path, mode),
-            };
+        let fs = self.visible_layer(path);
+        if mode == F_OK {
+            fs.access(path, F_OK)
+        } else {
+            fs.access(path, mode)
         }
-        if let Some(middle) = &self.middle {
-            if middle.access(path, F_OK) == 0 {
-                return match mode == F_OK {
-                    true => 0,
-                    false => middle.access(path, mode),
-                };
-            }
-        }
-        // Otherwise, base has the final answer
-        self.base.access(path, mode)
     }
 
     fn open(&self, path: &Path, oflag: i32, mode: mode_t) -> i32 {
-        // Is this a write request? They are special, because the dir struct might exist in a sub layer
-        if oflag & (O_WRONLY | O_RDWR | O_APPEND) > 0 {
-            let parent_dir = path.parent().unwrap();
-            // Dir exists? Forward
-
-            if self.top.access(parent_dir, F_OK) == 0 {
-                return self.top.open(path, oflag, mode);
-            }
-            // Path exist in a sub layer? Create Path
-            if self
-                .middle
-                .as_ref()
-                .is_some_and(|fs| fs.access(parent_dir, F_OK) == 0)
-                || self.base.access(parent_dir, F_OK) == 0
-            {
-                let ancestors: Vec<_> = parent_dir.ancestors().collect();
-                for p in ancestors.into_iter().rev() {
-                    if self.top.access(p, F_OK) != 0 {
-                        self.top.mkdir(p, 0o755);
-                    }
-                }
-            }
-            // Now attempt write normally
+        let writes = oflag & (O_WRONLY | O_RDWR | O_APPEND | O_CREAT | O_TRUNC) != 0;
+        if writes {
+            self.ensure_top_parent_dirs(path);
             return self.top.open(path, oflag, mode);
         }
 
-        // Read only. Basically use the first fs where it's found
-        if self.top.access(path, F_OK) == 0 {
-            return self.top.open(path, oflag, mode);
-        }
-        if let Some(middle) = &self.middle {
-            if middle.access(path, F_OK) == 0 {
-                return middle.open(path, oflag, mode);
-            }
-        }
-        // Base has the final answer
-        self.base.open(path, oflag, mode)
+        self.visible_layer(path).open(path, oflag, mode)
     }
 
-    fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
-        todo!()
+    fn openat(&self, _dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
+        self.open(path, flag, mode)
     }
 
     fn mkdir(&self, path: &Path, mode: mode_t) -> i32 {
@@ -118,19 +118,8 @@ impl LowLevelFS for OverlayFS {
     }
 
     fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
-        // Exists is upper layer? Use it
-        if self.top.access(path, F_OK) == 0 {
-            return self.top.chmod(path, mode);
-        }
-        if let Some(middle) = &self.middle {
-            if middle.access(path, F_OK) == 0 {
-                return middle.chmod(path, mode);
-            }
-        }
-        // Otherwise, base has the final answer
-        self.base.chmod(path, mode)
+        self.visible_layer(path).chmod(path, mode)
     }
-
 }
 
 #[cfg(test)]
@@ -141,11 +130,7 @@ mod test {
 
     #[test]
     fn test_overlay_access() {
-        let fs = OverlayFS::new(
-            "overlay",
-            MemoryFS::new("top"),
-            MemoryFS::new("base"),
-        );
+        let fs = OverlayFS::new("overlay", MemoryFS::new("top"), MemoryFS::new("base"));
         let test_path = Path::new("/bin");
         assert_ne!(fs.access(test_path, F_OK), 0);
 
@@ -153,5 +138,23 @@ mod test {
         fs.mkdir(test_path, 0);
         assert_eq!(fs.top_layer().access(test_path, F_OK), 0);
         assert_eq!(fs.access(test_path, F_OK), 0);
+    }
+
+    #[test]
+    fn test_overlay_creates_parent_dirs_without_touching_root() {
+        let top = MemoryFS::new("top");
+        let base = MemoryFS::new("base");
+        base.mkdir(Path::new("/home"), 0);
+        base.mkdir(Path::new("/home/leite"), 0);
+
+        let fs = OverlayFS::new("overlay", top, base);
+        fs.open(
+            Path::new("/home/leite/hello.txt"),
+            O_CREAT | O_WRONLY,
+            0o644,
+        );
+
+        assert_eq!(fs.top_layer().access(Path::new("/home"), F_OK), 0);
+        assert_eq!(fs.top_layer().access(Path::new("/home/leite"), F_OK), 0);
     }
 }

@@ -2,9 +2,11 @@
 #![allow(unused)]
 
 use super::AsCStr;
-use libc::{c_char, mode_t};
+use libc::mode_t;
 
-use crate::{filesystem::LowLevelFS, libc_hooks};
+use crate::filesystem::LowLevelFS;
+#[cfg(target_os = "linux")]
+use crate::libc_hooks;
 
 use std::{
     os::unix::ffi::OsStrExt,
@@ -37,7 +39,11 @@ impl BindFS {
     fn translate_path(&self, pth: impl AsRef<Path>) -> PathBuf {
         let mut components = pth.as_ref().components();
         assert_eq!(components.next().unwrap(), Component::RootDir);
-        let mut pth = self.root.join(components.as_path());
+        self.root.join(components.as_path())
+    }
+
+    fn translate_c_path(&self, pth: impl AsRef<Path>) -> PathBuf {
+        let mut pth = self.translate_path(pth);
         if !pth.as_os_str().as_bytes().last().is_some_and(|l| *l == 0) {
             pth.as_mut_os_string().push("\0");
         }
@@ -51,26 +57,54 @@ impl LowLevelFS for BindFS {
     }
 
     fn access(&self, pth: &Path, mode: i32) -> i32 {
-        let final_path = self.translate_path(pth);
+        let final_path = self.translate_c_path(pth);
         println!("  -> REAL access to {final_path:?}, o{mode:o}");
-        unsafe { libc_hooks::access::call_orig(final_path.as_cstr(), mode) }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc_hooks::access::call_orig(final_path.as_cstr(), mode)
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            libc::access(final_path.as_cstr(), mode)
+        }
     }
 
     fn open(&self, pth: &Path, oflag: i32, mode: mode_t) -> i32 {
-        let final_path = self.translate_path(pth);
+        let final_path = self.translate_c_path(pth);
         println!("  -> REAL open to {final_path:?}, o{mode:o}");
-        unsafe { libc_hooks::Open::call_orig(final_path.as_cstr(), oflag, mode) }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc_hooks::Open::call_orig(final_path.as_cstr(), oflag, mode)
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            libc::open(final_path.as_cstr(), oflag, mode as libc::c_uint)
+        }
     }
 
     fn mkdir(&self, pth: &Path, mode: mode_t) -> i32 {
-        let final_path = self.translate_path(pth);
+        let final_path = self.translate_c_path(pth);
         println!("  -> REAL mkdir to {final_path:?}, o{mode:o}");
-        unsafe { libc_hooks::mkdir::call_orig(final_path.as_cstr(), mode) }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc_hooks::mkdir::call_orig(final_path.as_cstr(), mode)
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            libc::mkdir(final_path.as_cstr(), mode)
+        }
     }
 
     fn chmod(&self, pth: &Path, mode: mode_t) -> i32 {
-        let final_path = self.translate_path(pth);
-        unsafe { libc_hooks::chmod::call_orig(final_path.as_cstr(), mode) }
+        let final_path = self.translate_c_path(pth);
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc_hooks::chmod::call_orig(final_path.as_cstr(), mode)
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            libc::chmod(final_path.as_cstr(), mode)
+        }
     }
 
     fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
