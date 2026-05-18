@@ -20,11 +20,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust nightly
-        run: rustup toolchain install nightly --profile minimal --component rustfmt
+      - name: Install Rust toolchain
+        run: rustup toolchain install
 
       - name: Check formatting
-        run: cargo +nightly fmt -- --check
+        run: cargo fmt -- --check
 
       - name: Run tests
-        run: cargo +nightly test
+        run: cargo test

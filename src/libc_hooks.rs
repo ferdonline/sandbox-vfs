@@ -12,7 +12,6 @@ use crate::{libc_hooks, BindFS, FromCStr, OverlayFS};
 
 // use crate::impls::memory::ALL_MEM_FS;
 
-use core::ffi::va_list;
 use std::path::Path;
 use std::sync::{LazyLock, Once};
 
@@ -110,7 +109,7 @@ dlhooks::hook! {
 pub unsafe extern "C" fn open(cpath: *const c_char, oflag: c_int, mut va_args: ...) -> i32 {
     let mode = match oflag & (libc::O_CREAT | libc::O_TMPFILE) {
         0 => 0,
-        _ => va_args.arg(),
+        _ => unsafe { va_args.arg::<libc::c_uint>() as mode_t },
     };
     unsafe {
         libc::printf(
@@ -149,7 +148,7 @@ pub unsafe extern "C" fn openat(
 ) -> c_int {
     let mode = match oflag & (libc::O_CREAT | libc::O_TMPFILE) {
         0 => 0,
-        _ => va_args.arg(),
+        _ => unsafe { va_args.arg::<libc::c_uint>() as mode_t },
     };
     unsafe {
         libc::printf(
@@ -176,7 +175,7 @@ pub unsafe extern "C" fn openat(
 pub unsafe extern "C" fn open64(cpath: *const c_char, oflag: c_int, mut va_args: ...) -> i32 {
     let mode = match oflag & (libc::O_CREAT | libc::O_TMPFILE) {
         0 => 0,
-        _ => va_args.arg(),
+        _ => unsafe { va_args.arg::<libc::c_uint>() as mode_t },
     };
     unsafe {
         libc::printf(

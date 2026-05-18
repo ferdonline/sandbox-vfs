@@ -5,7 +5,7 @@ use super::AsCStr;
 use libc::mode_t;
 
 use crate::filesystem::LowLevelFS;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(test)))]
 use crate::libc_hooks;
 
 use std::{
@@ -59,11 +59,11 @@ impl LowLevelFS for BindFS {
     fn access(&self, pth: &Path, mode: i32) -> i32 {
         let final_path = self.translate_c_path(pth);
         println!("  -> REAL access to {final_path:?}, o{mode:o}");
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(test)))]
         unsafe {
             libc_hooks::access::call_orig(final_path.as_cstr(), mode)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(not(target_os = "linux"), test))]
         unsafe {
             libc::access(final_path.as_cstr(), mode)
         }
@@ -72,11 +72,11 @@ impl LowLevelFS for BindFS {
     fn open(&self, pth: &Path, oflag: i32, mode: mode_t) -> i32 {
         let final_path = self.translate_c_path(pth);
         println!("  -> REAL open to {final_path:?}, o{mode:o}");
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(test)))]
         unsafe {
             libc_hooks::Open::call_orig(final_path.as_cstr(), oflag, mode)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(not(target_os = "linux"), test))]
         unsafe {
             libc::open(final_path.as_cstr(), oflag, mode as libc::c_uint)
         }
@@ -85,11 +85,11 @@ impl LowLevelFS for BindFS {
     fn mkdir(&self, pth: &Path, mode: mode_t) -> i32 {
         let final_path = self.translate_c_path(pth);
         println!("  -> REAL mkdir to {final_path:?}, o{mode:o}");
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(test)))]
         unsafe {
             libc_hooks::mkdir::call_orig(final_path.as_cstr(), mode)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(not(target_os = "linux"), test))]
         unsafe {
             libc::mkdir(final_path.as_cstr(), mode)
         }
@@ -97,11 +97,11 @@ impl LowLevelFS for BindFS {
 
     fn chmod(&self, pth: &Path, mode: mode_t) -> i32 {
         let final_path = self.translate_c_path(pth);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(test)))]
         unsafe {
             libc_hooks::chmod::call_orig(final_path.as_cstr(), mode)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(not(target_os = "linux"), test))]
         unsafe {
             libc::chmod(final_path.as_cstr(), mode)
         }
