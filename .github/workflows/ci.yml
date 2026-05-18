@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal --component rustfmt
+
+      - name: Check formatting
+        run: cargo +nightly fmt -- --check
+
+      - name: Run tests
+        run: cargo +nightly test
