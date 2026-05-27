@@ -79,6 +79,15 @@ dlhooks::hook! {
     }
 }
 dlhooks::hook! {
+    unsafe fn close(fd: c_int) -> c_int => {
+        let result = Self::call_orig(fd);
+        if result == 0 {
+            VFS.forget_fd(fd);
+        }
+        result
+    }
+}
+dlhooks::hook! {
     unsafe fn mkdir(path: *const c_char, mode: mode_t) -> c_int => {
         VFS.mkdir(Path::from_cstr(path), mode)
     }
