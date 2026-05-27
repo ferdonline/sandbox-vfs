@@ -6,14 +6,14 @@
 //! The main interaction with the virtual filesystem is by using virtual paths ([`VfsPath`](path/struct.VfsPath.html)).
 //!
 //! This crate currently has the following implementations:
-#![cfg_attr(all(target_os = "linux", not(test)), feature(c_variadic))]
+#![cfg_attr(all(target_os = "linux", feature = "hooks"), feature(c_variadic))]
 pub mod filesystem;
 pub mod impls;
-#[cfg(all(target_os = "linux", not(test)))]
+#[cfg(all(target_os = "linux", feature = "hooks"))]
 pub mod libc_hooks;
 pub mod root_vfs;
 
-#[cfg(all(target_os = "linux", not(test)))]
+#[cfg(all(target_os = "linux", feature = "hooks"))]
 pub mod dlhooks;
 
 pub use impls::bindfs::BindFS;
