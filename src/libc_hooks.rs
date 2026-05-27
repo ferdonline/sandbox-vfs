@@ -159,14 +159,7 @@ pub unsafe extern "C" fn openat(
         );
     }
 
-    let addr = libc::dlsym(libc::RTLD_NEXT, b"openat\0".as_ptr() as *const c_char);
-    if !addr.is_null() {
-        let fn_ptr: fn(_, _, _, _) -> i32 = unsafe { ::std::mem::transmute(addr) };
-        (fn_ptr)(dirfd, cpath, oflag, mode)
-    } else {
-        eprintln!("Failed to load real openat");
-        -1
-    }
+    VFS.openat(dirfd, Path::from_cstr(cpath), oflag, mode)
 }
 
 // NOTE: variadic arg functions are a bit pain since rust macros don't handle ...
