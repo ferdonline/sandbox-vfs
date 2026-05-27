@@ -12,4 +12,4 @@ edition = "2021"
 libc = "0.2.173"
 
 [lib]
-crate-type = ["dylib"]
+crate-type = ["dylib", "rlib"]
