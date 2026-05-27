@@ -102,6 +102,13 @@ impl MemoryFS {
         todo!()
     }
 
+    fn assert_absolute(path: &Path) {
+        assert!(
+            path.is_absolute(),
+            "MemoryFS backends only accept absolute paths, got {path:?}"
+        );
+    }
+
     fn parent_is_dir(&self, path: &Path) -> bool {
         path.parent().is_some_and(|parent| {
             self.fs
@@ -120,7 +127,9 @@ impl MemoryFS {
     }
 
     fn create_entry(&self, path: &Path, kind: FileKind) -> i32 {
-        if !path.is_absolute() || path == Path::new("/") || !self.parent_is_dir(path) {
+        Self::assert_absolute(path);
+
+        if path == Path::new("/") || !self.parent_is_dir(path) {
             return -1;
         }
 
@@ -158,6 +167,8 @@ impl LowLevelFS for MemoryFS {
     }
 
     fn access(&self, path: &std::path::Path, _mode: i32) -> i32 {
+        Self::assert_absolute(path);
+
         // fine if file exists
         match self.fs.read().unwrap().contains_key(path) {
             true => 0,
@@ -166,6 +177,8 @@ impl LowLevelFS for MemoryFS {
     }
 
     fn open(&self, path: &std::path::Path, oflag: i32, _mode: mode_t) -> RawFd {
+        Self::assert_absolute(path);
+
         if let Some(memfile) = self.fs.read().unwrap().get(path) {
             return memfile.fd;
         }
@@ -187,14 +200,17 @@ impl LowLevelFS for MemoryFS {
     }
 
     fn chmod(&self, path: &Path, _mode: mode_t) -> i32 {
+        Self::assert_absolute(path);
+
         match self.fs.read().unwrap().contains_key(path) {
             true => 0,
             false => -1,
         }
     }
 
-    fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
-        todo!()
+    fn openat(&self, _dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
+        Self::assert_absolute(path);
+        self.open(path, flag, mode)
     }
 }
 
@@ -277,7 +293,12 @@ mod test {
         assert!(fd > 0);
         assert_eq!(fs.access(Path::new("/hello.txt"), F_OK), 0);
         assert_eq!(
-            fs.fs.read().unwrap().get(Path::new("/hello.txt")).unwrap().kind,
+            fs.fs
+                .read()
+                .unwrap()
+                .get(Path::new("/hello.txt"))
+                .unwrap()
+                .kind,
             FileKind::File
         );
     }
@@ -295,5 +316,39 @@ mod test {
         let fs = MemoryFS::new("");
 
         assert_ne!(fs.chmod(Path::new("/missing"), 0o755), 0);
+    }
+
+    #[test]
+    fn test_openat_accepts_absolute_path() {
+        let fs = MemoryFS::new("");
+
+        let fd = fs.openat(libc::AT_FDCWD, Path::new("/hello.txt"), O_CREAT, 0o644);
+
+        assert!(fd > 0);
+        assert_eq!(fs.access(Path::new("/hello.txt"), F_OK), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "MemoryFS backends only accept absolute paths")]
+    fn test_openat_panics_for_relative_path() {
+        let fs = MemoryFS::new("");
+
+        fs.openat(libc::AT_FDCWD, Path::new("hello.txt"), O_CREAT, 0o644);
+    }
+
+    #[test]
+    #[should_panic(expected = "MemoryFS backends only accept absolute paths")]
+    fn test_open_panics_for_relative_path() {
+        let fs = MemoryFS::new("");
+
+        fs.open(Path::new("hello.txt"), O_CREAT, 0o644);
+    }
+
+    #[test]
+    #[should_panic(expected = "MemoryFS backends only accept absolute paths")]
+    fn test_mkdir_panics_for_relative_path() {
+        let fs = MemoryFS::new("");
+
+        fs.mkdir(Path::new("tmp"), 0o755);
     }
 }
