@@ -106,14 +106,10 @@ dlhooks::hook! {
 }
 dlhooks::hook! {
     unsafe fn getdents64(fd: c_int, dirp: *mut c_void, count: c_int) -> isize => {
-        // We need to intercept this one operating on fd because the memory backend is not a real one
-        let memfs_id = fd / 10000;
-        // if memfs_id > 0 {
-        //     ALL_MEM_FS[memfs_id as usize - 1].getdents64(fd, dirp, count)
-        // }
-        // else {
-            Self::call_orig(fd, dirp, count)
-        // }
+        match VFS.getdents64(fd, dirp, count) {
+            Some(result) => result,
+            None => Self::call_orig(fd, dirp, count),
+        }
     }
 }
 

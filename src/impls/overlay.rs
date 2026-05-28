@@ -2,7 +2,7 @@ use std::path::Path;
 
 use libc::{mode_t, F_OK, O_APPEND, O_CREAT, O_RDWR, O_TRUNC, O_WRONLY};
 
-use crate::filesystem::LowLevelFS;
+use crate::filesystem::{LowLevelFS, VfsDirEntry};
 
 /// A purely virtual overlay FS
 #[allow(unused)]
@@ -120,6 +120,36 @@ impl LowLevelFS for OverlayFS {
 
     fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
         self.visible_layer(path).chmod(path, mode)
+    }
+
+    fn read_dir(&self, path: &Path) -> Option<Vec<VfsDirEntry>> {
+        let mut entries = Vec::new();
+        let mut saw_virtual_layer = false;
+
+        for layer in [
+            Some(self.top.as_ref()),
+            self.middle.as_deref(),
+            Some(self.base.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let Some(layer_entries) = layer.read_dir(path) else {
+                continue;
+            };
+
+            saw_virtual_layer = true;
+            for entry in layer_entries {
+                if !entries
+                    .iter()
+                    .any(|existing: &VfsDirEntry| existing.name == entry.name)
+                {
+                    entries.push(entry);
+                }
+            }
+        }
+
+        saw_virtual_layer.then_some(entries)
     }
 }
 

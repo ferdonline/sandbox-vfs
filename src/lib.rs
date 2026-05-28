@@ -11,6 +11,7 @@ pub mod filesystem;
 pub mod impls;
 #[cfg(all(target_os = "linux", feature = "hooks"))]
 pub mod libc_hooks;
+pub mod linux_dirents;
 pub mod root_vfs;
 
 #[cfg(all(target_os = "linux", feature = "hooks"))]
