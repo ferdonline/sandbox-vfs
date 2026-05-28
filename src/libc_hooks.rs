@@ -12,35 +12,42 @@ use crate::{libc_hooks, BindFS, FromCStr, OverlayFS};
 
 // use crate::impls::memory::ALL_MEM_FS;
 
-use std::path::Path;
+use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, OnceLock};
 
+const LOWER_ENV: &str = "SANDBOX_VFS_LOWER";
+const UPPER_ENV: &str = "SANDBOX_VFS_UPPER";
+
 static VFS: LazyLock<RootVFS> = LazyLock::new(|| {
-    // Paths relative to crate dir
-    let root_path = Path::new(file!())
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("fakefs")
-        .canonicalize()
-        .unwrap();
-    let overlay_rw = Path::new(file!())
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("overlay_rw")
-        .canonicalize()
-        .unwrap();
-    // RootVFS::new(Box::new(BindFS::new("fakefs", root_path)))
+    let lower = required_dir_from_env(LOWER_ENV);
+    let upper = required_dir_from_env(UPPER_ENV);
 
     RootVFS::new(Box::new(OverlayFS::new(
         "overlay",
-        Box::new(BindFS::new("overlay_rw", overlay_rw)),
-        Box::new(BindFS::new("fakefs", root_path)),
+        Box::new(BindFS::new("upper", upper)),
+        Box::new(BindFS::new("lower", lower)),
     )))
 });
+
+fn required_dir_from_env(name: &str) -> PathBuf {
+    let value =
+        env::var_os(name).unwrap_or_else(|| panic!("{name} must point to an existing directory"));
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|err| panic!("failed to resolve current directory for {name}: {err}"))
+            .join(path)
+    };
+
+    if !path.is_dir() {
+        panic!("{name} must point to an existing directory: {path:?}");
+    }
+
+    path
+}
 
 dlhooks::hook! {
     unsafe fn accessat(dirfd: c_int, cpath: *const c_char, mode: c_int, flags: c_int) -> c_int => {
