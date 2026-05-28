@@ -114,6 +114,7 @@ impl LowLevelFS for OverlayFS {
     fn mkdir(&self, path: &Path, mode: mode_t) -> i32 {
         // Write operation targets only the top layer
         // If existed in lower layer it shadows it
+        self.ensure_top_parent_dirs(path);
         self.top.mkdir(path, mode)
     }
 

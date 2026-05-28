@@ -51,7 +51,7 @@ cargo test
 Build the interceptor library on Linux with:
 
 ```sh
-cargo build
+cargo build --features hooks
 ```
 
 The example writer binary is useful when testing interception manually:
