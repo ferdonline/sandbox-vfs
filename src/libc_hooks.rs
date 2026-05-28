@@ -13,7 +13,7 @@ use crate::{libc_hooks, BindFS, FromCStr, OverlayFS};
 // use crate::impls::memory::ALL_MEM_FS;
 
 use std::path::Path;
-use std::sync::{LazyLock, Once};
+use std::sync::{LazyLock, OnceLock};
 
 static VFS: LazyLock<RootVFS> = LazyLock::new(|| {
     // Paths relative to crate dir
@@ -51,9 +51,7 @@ dlhooks::hook! {
 }
 dlhooks::hook! {
     unsafe fn access(cpath: *const c_char, mode: c_int) -> c_int => {
-        #[cfg(test)]
-        libc::printf(b"> Intercepted with params:%s %d\0".as_ptr() as *const c_char, cpath, mode);
-        Self::call_orig(cpath, mode)
+        VFS.access(Path::from_cstr(cpath), mode)
     }
 }
 dlhooks::hook! {
@@ -75,7 +73,7 @@ dlhooks::hook! {
 }
 dlhooks::hook! {
     unsafe fn creat(path: *const c_char, mode: mode_t) -> c_int => {
-        Self::call_orig(path, mode)
+        VFS.open(Path::from_cstr(path), libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC, mode)
     }
 }
 dlhooks::hook! {
@@ -120,29 +118,16 @@ pub unsafe extern "C" fn open(cpath: *const c_char, oflag: c_int, mut va_args: .
         0 => 0,
         _ => unsafe { va_args.arg::<libc::c_uint>() as mode_t },
     };
-    unsafe {
-        libc::printf(
-            b"> Intercepted open with params: %s %d\n\0".as_ptr() as *const c_char,
-            cpath,
-            oflag as i32,
-        );
-    }
     VFS.open(Path::from_cstr(cpath), oflag, mode)
 }
 
 pub struct Open;
 impl Open {
     pub fn call_orig(cpath: *const c_char, oflag: c_int, mode: mode_t) -> i32 {
-        use ::std::sync::Once;
-        static mut REAL: *const u8 = 0 as *const u8;
-        static mut ONCE: Once = Once::new();
-        let fn_ptr: fn(_, _, _) -> i32 = unsafe {
-            ONCE.call_once(|| {
-                REAL = crate::dlhooks::dlsym_next("open\0");
-            });
-            ::std::mem::transmute(REAL)
-        };
-        (fn_ptr)(cpath, oflag, mode)
+        static REAL: OnceLock<usize> = OnceLock::new();
+        let real = *REAL.get_or_init(|| crate::dlhooks::dlsym_next("open\0") as usize);
+        let fn_ptr: unsafe extern "C" fn(_, _, _) -> i32 = unsafe { ::std::mem::transmute(real) };
+        unsafe { fn_ptr(cpath, oflag, mode) }
     }
 }
 
@@ -159,15 +144,6 @@ pub unsafe extern "C" fn openat(
         0 => 0,
         _ => unsafe { va_args.arg::<libc::c_uint>() as mode_t },
     };
-    unsafe {
-        libc::printf(
-            b"> Intercepted openAt with params: %d %s %d\n\0".as_ptr() as *const c_char,
-            dirfd,
-            cpath,
-            oflag as i32,
-        );
-    }
-
     VFS.openat(dirfd, Path::from_cstr(cpath), oflag, mode)
 }
 
@@ -179,13 +155,6 @@ pub unsafe extern "C" fn open64(cpath: *const c_char, oflag: c_int, mut va_args:
         0 => 0,
         _ => unsafe { va_args.arg::<libc::c_uint>() as mode_t },
     };
-    unsafe {
-        libc::printf(
-            b"> Intercepted open64 with params: %s %d\n\0".as_ptr() as *const c_char,
-            cpath,
-            oflag as i32,
-        );
-    }
     VFS.open(Path::from_cstr(cpath), oflag, mode)
 }
 

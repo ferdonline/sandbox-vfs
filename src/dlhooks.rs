@@ -11,8 +11,8 @@ extern "C" {
 
 const RTLD_NEXT: *const c_void = -1isize as *const c_void;
 
-pub unsafe fn dlsym_next(symbol: &'static str) -> *const u8 {
-    let ptr = dlsym(RTLD_NEXT, symbol.as_ptr() as *const c_char);
+pub fn dlsym_next(symbol: &'static str) -> *const u8 {
+    let ptr = unsafe { dlsym(RTLD_NEXT, symbol.as_ptr() as *const c_char) };
     if ptr.is_null() {
         panic!("redhook: Unable to find underlying function for {}", symbol);
     }
@@ -33,16 +33,12 @@ macro_rules! hook {
             }
 
             pub fn orig() -> unsafe extern "C" fn ( $($v : $t),* ) -> $r {
-                use ::std::sync::Once;
-                static mut REAL: *const u8 = 0 as *const u8;
-                static mut ONCE: Once = Once::new();
+                static REAL: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
+                let real = *REAL.get_or_init(|| {
+                    $crate::dlhooks::dlsym_next(concat!(stringify!($real_fn), "\0")) as usize
+                });
 
-                unsafe {
-                    ONCE.call_once(|| {
-                        REAL = crate::dlhooks::dlsym_next(concat!(stringify!($real_fn), "\0"));
-                    });
-                    ::std::mem::transmute(REAL)
-                }
+                unsafe { ::std::mem::transmute(real) }
             }
 
             pub fn call_orig( $($v : $t),* ) -> $r {
