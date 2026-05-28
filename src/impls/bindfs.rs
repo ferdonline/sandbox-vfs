@@ -58,6 +58,7 @@ impl LowLevelFS for BindFS {
 
     fn access(&self, pth: &Path, mode: i32) -> i32 {
         let final_path = self.translate_c_path(pth);
+        #[cfg(test)]
         println!("  -> REAL access to {final_path:?}, o{mode:o}");
         #[cfg(all(target_os = "linux", feature = "hooks"))]
         unsafe {
@@ -71,6 +72,7 @@ impl LowLevelFS for BindFS {
 
     fn open(&self, pth: &Path, oflag: i32, mode: mode_t) -> i32 {
         let final_path = self.translate_c_path(pth);
+        #[cfg(test)]
         println!("  -> REAL open to {final_path:?}, o{mode:o}");
         #[cfg(all(target_os = "linux", feature = "hooks"))]
         unsafe {
@@ -84,6 +86,7 @@ impl LowLevelFS for BindFS {
 
     fn mkdir(&self, pth: &Path, mode: mode_t) -> i32 {
         let final_path = self.translate_c_path(pth);
+        #[cfg(test)]
         println!("  -> REAL mkdir to {final_path:?}, o{mode:o}");
         #[cfg(all(target_os = "linux", feature = "hooks"))]
         unsafe {

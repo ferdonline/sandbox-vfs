@@ -8,39 +8,68 @@ use libc::{c_char, c_int, c_void, gid_t, mode_t, size_t, uid_t};
 use super::dlhooks;
 use crate::filesystem::LowLevelFS;
 use crate::root_vfs::RootVFS;
-use crate::{libc_hooks, BindFS, FromCStr, OverlayFS};
+use crate::{libc_hooks, BindFS, FromCStr, MemoryFS, OverlayFS};
 
 // use crate::impls::memory::ALL_MEM_FS;
 
-use std::path::Path;
-use std::sync::{LazyLock, Once};
+use std::env;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, OnceLock};
+
+const LOWER_ENV: &str = "SANDBOX_VFS_LOWER";
+const UPPER_ENV: &str = "SANDBOX_VFS_UPPER";
+const BACKEND_ENV: &str = "SANDBOX_VFS_BACKEND";
+const MEMORY_MOUNT_ENV: &str = "SANDBOX_VFS_MEMORY_MOUNT";
 
 static VFS: LazyLock<RootVFS> = LazyLock::new(|| {
-    // Paths relative to crate dir
-    let root_path = Path::new(file!())
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("fakefs")
-        .canonicalize()
-        .unwrap();
-    let overlay_rw = Path::new(file!())
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("overlay_rw")
-        .canonicalize()
-        .unwrap();
-    // RootVFS::new(Box::new(BindFS::new("fakefs", root_path)))
+    match env::var(BACKEND_ENV).as_deref() {
+        Ok("memory") => return RootVFS::new(MemoryFS::new("memory")),
+        Ok("overlay") | Err(_) => {}
+        Ok(other) => panic!("{BACKEND_ENV} must be either 'overlay' or 'memory', got {other:?}"),
+    }
 
-    RootVFS::new(Box::new(OverlayFS::new(
+    let lower = required_dir_from_env(LOWER_ENV);
+    let upper = required_dir_from_env(UPPER_ENV);
+
+    let root = RootVFS::new(Box::new(OverlayFS::new(
         "overlay",
-        Box::new(BindFS::new("overlay_rw", overlay_rw)),
-        Box::new(BindFS::new("fakefs", root_path)),
-    )))
+        Box::new(BindFS::new("upper", upper)),
+        Box::new(BindFS::new("lower", lower)),
+    )));
+
+    match optional_absolute_path_from_env(MEMORY_MOUNT_ENV) {
+        Some(path) => root.with_mount(path, MemoryFS::new("memory")),
+        None => root,
+    }
 });
+
+fn required_dir_from_env(name: &str) -> PathBuf {
+    let value =
+        env::var_os(name).unwrap_or_else(|| panic!("{name} must point to an existing directory"));
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|err| panic!("failed to resolve current directory for {name}: {err}"))
+            .join(path)
+    };
+
+    if !path.is_dir() {
+        panic!("{name} must point to an existing directory: {path:?}");
+    }
+
+    path
+}
+
+fn optional_absolute_path_from_env(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(env::var_os(name)?);
+    if !path.is_absolute() {
+        panic!("{name} must be an absolute virtual path, got {path:?}");
+    }
+
+    Some(path)
+}
 
 dlhooks::hook! {
     unsafe fn accessat(dirfd: c_int, cpath: *const c_char, mode: c_int, flags: c_int) -> c_int => {
@@ -51,9 +80,7 @@ dlhooks::hook! {
 }
 dlhooks::hook! {
     unsafe fn access(cpath: *const c_char, mode: c_int) -> c_int => {
-        #[cfg(test)]
-        libc::printf(b"> Intercepted with params:%s %d\0".as_ptr() as *const c_char, cpath, mode);
-        Self::call_orig(cpath, mode)
+        VFS.access(Path::from_cstr(cpath), mode)
     }
 }
 dlhooks::hook! {
@@ -75,7 +102,7 @@ dlhooks::hook! {
 }
 dlhooks::hook! {
     unsafe fn creat(path: *const c_char, mode: mode_t) -> c_int => {
-        Self::call_orig(path, mode)
+        VFS.open(Path::from_cstr(path), libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC, mode)
     }
 }
 dlhooks::hook! {
@@ -94,21 +121,15 @@ dlhooks::hook! {
 }
 dlhooks::hook! {
     unsafe fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: mode_t) -> c_int => {
-        #[cfg(test)]
-        libc::printf(b"> Intercepted mkdirat with params: %d %s %d\0".as_ptr() as *const c_char, dirfd, pathname, mode as i32);
-        Self::call_orig(dirfd, pathname, mode)
+        VFS.mkdirat(dirfd, Path::from_cstr(pathname), mode)
     }
 }
 dlhooks::hook! {
     unsafe fn getdents64(fd: c_int, dirp: *mut c_void, count: c_int) -> isize => {
-        // We need to intercept this one operating on fd because the memory backend is not a real one
-        let memfs_id = fd / 10000;
-        // if memfs_id > 0 {
-        //     ALL_MEM_FS[memfs_id as usize - 1].getdents64(fd, dirp, count)
-        // }
-        // else {
-            Self::call_orig(fd, dirp, count)
-        // }
+        match VFS.getdents64(fd, dirp, count) {
+            Some(result) => result,
+            None => Self::call_orig(fd, dirp, count),
+        }
     }
 }
 
@@ -120,29 +141,16 @@ pub unsafe extern "C" fn open(cpath: *const c_char, oflag: c_int, mut va_args: .
         0 => 0,
         _ => unsafe { va_args.arg::<libc::c_uint>() as mode_t },
     };
-    unsafe {
-        libc::printf(
-            b"> Intercepted open with params: %s %d\n\0".as_ptr() as *const c_char,
-            cpath,
-            oflag as i32,
-        );
-    }
     VFS.open(Path::from_cstr(cpath), oflag, mode)
 }
 
 pub struct Open;
 impl Open {
     pub fn call_orig(cpath: *const c_char, oflag: c_int, mode: mode_t) -> i32 {
-        use ::std::sync::Once;
-        static mut REAL: *const u8 = 0 as *const u8;
-        static mut ONCE: Once = Once::new();
-        let fn_ptr: fn(_, _, _) -> i32 = unsafe {
-            ONCE.call_once(|| {
-                REAL = crate::dlhooks::dlsym_next("open\0");
-            });
-            ::std::mem::transmute(REAL)
-        };
-        (fn_ptr)(cpath, oflag, mode)
+        static REAL: OnceLock<usize> = OnceLock::new();
+        let real = *REAL.get_or_init(|| crate::dlhooks::dlsym_next("open\0") as usize);
+        let fn_ptr: unsafe extern "C" fn(_, _, _) -> i32 = unsafe { ::std::mem::transmute(real) };
+        unsafe { fn_ptr(cpath, oflag, mode) }
     }
 }
 
@@ -159,15 +167,6 @@ pub unsafe extern "C" fn openat(
         0 => 0,
         _ => unsafe { va_args.arg::<libc::c_uint>() as mode_t },
     };
-    unsafe {
-        libc::printf(
-            b"> Intercepted openAt with params: %d %s %d\n\0".as_ptr() as *const c_char,
-            dirfd,
-            cpath,
-            oflag as i32,
-        );
-    }
-
     VFS.openat(dirfd, Path::from_cstr(cpath), oflag, mode)
 }
 
@@ -179,13 +178,6 @@ pub unsafe extern "C" fn open64(cpath: *const c_char, oflag: c_int, mut va_args:
         0 => 0,
         _ => unsafe { va_args.arg::<libc::c_uint>() as mode_t },
     };
-    unsafe {
-        libc::printf(
-            b"> Intercepted open64 with params: %s %d\n\0".as_ptr() as *const c_char,
-            cpath,
-            oflag as i32,
-        );
-    }
     VFS.open(Path::from_cstr(cpath), oflag, mode)
 }
 

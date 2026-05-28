@@ -18,7 +18,7 @@ use std::{
 
 use libc::{c_void, mode_t, O_CREAT};
 
-use crate::filesystem::LowLevelFS;
+use crate::filesystem::{LowLevelFS, VfsDirEntry, VfsEntryKind};
 
 // We need to keep track of all MemFS due to intercepting calls with virtual fd's
 // pub static ALL_MEM_FS: AppendOnlyVec<&MemoryFS> = AppendOnlyVec::new();
@@ -206,6 +206,34 @@ impl LowLevelFS for MemoryFS {
             true => 0,
             false => -1,
         }
+    }
+
+    fn read_dir(&self, path: &Path) -> Option<Vec<VfsDirEntry>> {
+        Self::assert_absolute(path);
+
+        let fs = self.fs.read().unwrap();
+        if fs.get(path).is_none_or(|entry| entry.kind != FileKind::Dir) {
+            return None;
+        }
+
+        let mut entries = fs
+            .iter()
+            .filter_map(|(entry_path, entry)| {
+                if entry_path == path || entry_path.parent() != Some(path) {
+                    return None;
+                }
+
+                Some(VfsDirEntry {
+                    name: entry_path.file_name()?.to_os_string(),
+                    kind: match entry.kind {
+                        FileKind::File => VfsEntryKind::File,
+                        FileKind::Dir => VfsEntryKind::Dir,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Some(entries)
     }
 
     fn openat(&self, _dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {

@@ -54,6 +54,23 @@ Build the interceptor library on Linux with:
 cargo build --features hooks
 ```
 
+The interceptor expects two directories at runtime:
+
+- `SANDBOX_VFS_LOWER`: the read-through filesystem view.
+- `SANDBOX_VFS_UPPER`: the writable overlay layer.
+
+For example:
+
+```sh
+mkdir -p /tmp/sandbox-vfs-upper
+cargo build --features hooks --lib --bin file_writer
+SANDBOX_VFS_LOWER=/ \
+SANDBOX_VFS_UPPER=/tmp/sandbox-vfs-upper \
+LD_PRELOAD="$PWD/target/debug/libsandbox_vfs.so" \
+target/debug/file_writer "hello" /sandbox-vfs-demo.txt
+cat /tmp/sandbox-vfs-upper/sandbox-vfs-demo.txt
+```
+
 The example writer binary is useful when testing interception manually:
 
 ```sh

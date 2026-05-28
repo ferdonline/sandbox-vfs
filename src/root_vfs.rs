@@ -7,16 +7,23 @@ use std::{
     sync::RwLock,
 };
 
-use libc::{mode_t, AT_FDCWD};
+use libc::{c_void, mode_t, AT_FDCWD};
 
 use crate::filesystem::LowLevelFS;
+use crate::linux_dirents;
+
+#[derive(Debug, Clone)]
+struct FdInfo {
+    path: PathBuf,
+    dir_offset: usize,
+}
 
 #[derive(Debug)]
 pub struct RootVFS {
     root: Box<dyn LowLevelFS>,
     mounts: HashMap<PathBuf, Box<dyn LowLevelFS>>,
     cwd: RwLock<PathBuf>,
-    fds: RwLock<HashMap<i32, PathBuf>>,
+    fds: RwLock<HashMap<i32, FdInfo>>,
 }
 
 #[allow(unused)]
@@ -67,7 +74,7 @@ impl RootVFS {
 
         let fds = self.fds.read().unwrap();
         fds.get(&dirfd)
-            .map(|base| Self::normalize_absolute(&base.join(path)))
+            .map(|base| Self::normalize_absolute(&base.path.join(path)))
     }
 
     fn normalize_absolute(path: &Path) -> PathBuf {
@@ -112,13 +119,68 @@ impl RootVFS {
 
     fn track_fd(&self, fd: i32, path: PathBuf) -> i32 {
         if fd >= 0 {
-            self.fds.write().unwrap().insert(fd, path);
+            self.fds.write().unwrap().insert(
+                fd,
+                FdInfo {
+                    path,
+                    dir_offset: 0,
+                },
+            );
         }
         fd
     }
 
     pub fn forget_fd(&self, fd: i32) {
         self.fds.write().unwrap().remove(&fd);
+    }
+
+    pub fn mkdirat(&self, dirfd: i32, path: &Path, mode: mode_t) -> i32 {
+        let Some(virtual_path) = self.resolve_openat_path(dirfd, path) else {
+            return -1;
+        };
+
+        let (fs, backend_path) = self.absolute_path_to_fs(virtual_path);
+        fs.mkdir(&backend_path, mode)
+    }
+
+    /// Fill a Linux `getdents64` buffer for a tracked virtual directory fd.
+    ///
+    /// Returns `None` when `fd` is unknown or the underlying backend cannot
+    /// enumerate the directory virtually. In that case the libc hook should
+    /// call the real `getdents64`.
+    ///
+    /// # Safety
+    ///
+    /// `dirp` must point to a writable buffer of at least `count` bytes, using
+    /// the same contract as Linux `getdents64`.
+    pub unsafe fn getdents64(&self, fd: i32, dirp: *mut c_void, count: i32) -> Option<isize> {
+        let (virtual_path, dir_offset) = {
+            let fds = self.fds.read().unwrap();
+            let info = fds.get(&fd)?;
+            (info.path.clone(), info.dir_offset)
+        };
+
+        let (fs, backend_path) = self.absolute_path_to_fs(virtual_path.clone());
+        let mut entries = Vec::from(linux_dirents::dot_entries());
+        entries.extend(fs.read_dir(&backend_path)?);
+
+        let result = unsafe {
+            linux_dirents::write_dirents64(
+                &virtual_path,
+                &entries[dir_offset..],
+                dir_offset,
+                dirp,
+                count,
+            )
+        };
+
+        if result.bytes_written >= 0 {
+            if let Some(info) = self.fds.write().unwrap().get_mut(&fd) {
+                info.dir_offset += result.entries_consumed;
+            }
+        }
+
+        Some(result.bytes_written)
     }
 }
 
@@ -160,8 +222,9 @@ impl LowLevelFS for RootVFS {
 
 #[cfg(test)]
 mod test {
+    use std::ffi::CStr;
 
-    use libc::{F_OK, O_CREAT, O_RDONLY};
+    use libc::{c_void, F_OK, O_CREAT, O_RDONLY};
 
     use crate::MemoryFS;
 
@@ -286,5 +349,48 @@ mod test {
         root.forget_fd(dirfd);
 
         assert_ne!(root.openat(dirfd, Path::new("out.txt"), O_CREAT, 0o644), 0);
+    }
+
+    #[test]
+    fn test_getdents64_reads_memory_directory_entries() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+        root.mkdir(Path::new("/work/subdir"), 0o755);
+        assert!(root.open(Path::new("/work/file.txt"), O_CREAT, 0o644) > 0);
+
+        let dirfd = root.open(Path::new("/work"), O_RDONLY, 0);
+        let mut buf = vec![0_u8; 1024];
+
+        let written = unsafe {
+            root.getdents64(dirfd, buf.as_mut_ptr().cast::<c_void>(), buf.len() as i32)
+                .unwrap()
+        };
+
+        assert!(written > 0);
+        assert_eq!(
+            dirent_names(&buf[..written as usize]),
+            vec![".", "..", "file.txt", "subdir"]
+        );
+
+        let written = unsafe {
+            root.getdents64(dirfd, buf.as_mut_ptr().cast::<c_void>(), buf.len() as i32)
+                .unwrap()
+        };
+
+        assert_eq!(written, 0);
+    }
+
+    fn dirent_names(buf: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut offset = 0;
+
+        while offset < buf.len() {
+            let reclen = u16::from_ne_bytes([buf[offset + 16], buf[offset + 17]]) as usize;
+            let name = unsafe { CStr::from_ptr(buf[offset + 19..].as_ptr().cast()) };
+            names.push(name.to_string_lossy().into_owned());
+            offset += reclen;
+        }
+
+        names
     }
 }

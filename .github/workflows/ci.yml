@@ -27,3 +27,11 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+      - name: Check hooks feature
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check --features hooks --lib
+
+      - name: Run LD_PRELOAD smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: bash tests/preload_smoke.sh
