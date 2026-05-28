@@ -8,7 +8,7 @@ use libc::{c_char, c_int, c_void, gid_t, mode_t, size_t, uid_t};
 use super::dlhooks;
 use crate::filesystem::LowLevelFS;
 use crate::root_vfs::RootVFS;
-use crate::{libc_hooks, BindFS, FromCStr, OverlayFS};
+use crate::{libc_hooks, BindFS, FromCStr, MemoryFS, OverlayFS};
 
 // use crate::impls::memory::ALL_MEM_FS;
 
@@ -18,16 +18,29 @@ use std::sync::{LazyLock, OnceLock};
 
 const LOWER_ENV: &str = "SANDBOX_VFS_LOWER";
 const UPPER_ENV: &str = "SANDBOX_VFS_UPPER";
+const BACKEND_ENV: &str = "SANDBOX_VFS_BACKEND";
+const MEMORY_MOUNT_ENV: &str = "SANDBOX_VFS_MEMORY_MOUNT";
 
 static VFS: LazyLock<RootVFS> = LazyLock::new(|| {
+    match env::var(BACKEND_ENV).as_deref() {
+        Ok("memory") => return RootVFS::new(MemoryFS::new("memory")),
+        Ok("overlay") | Err(_) => {}
+        Ok(other) => panic!("{BACKEND_ENV} must be either 'overlay' or 'memory', got {other:?}"),
+    }
+
     let lower = required_dir_from_env(LOWER_ENV);
     let upper = required_dir_from_env(UPPER_ENV);
 
-    RootVFS::new(Box::new(OverlayFS::new(
+    let root = RootVFS::new(Box::new(OverlayFS::new(
         "overlay",
         Box::new(BindFS::new("upper", upper)),
         Box::new(BindFS::new("lower", lower)),
-    )))
+    )));
+
+    match optional_absolute_path_from_env(MEMORY_MOUNT_ENV) {
+        Some(path) => root.with_mount(path, MemoryFS::new("memory")),
+        None => root,
+    }
 });
 
 fn required_dir_from_env(name: &str) -> PathBuf {
@@ -47,6 +60,15 @@ fn required_dir_from_env(name: &str) -> PathBuf {
     }
 
     path
+}
+
+fn optional_absolute_path_from_env(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(env::var_os(name)?);
+    if !path.is_absolute() {
+        panic!("{name} must be an absolute virtual path, got {path:?}");
+    }
+
+    Some(path)
 }
 
 dlhooks::hook! {
@@ -99,9 +121,7 @@ dlhooks::hook! {
 }
 dlhooks::hook! {
     unsafe fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: mode_t) -> c_int => {
-        #[cfg(test)]
-        libc::printf(b"> Intercepted mkdirat with params: %d %s %d\0".as_ptr() as *const c_char, dirfd, pathname, mode as i32);
-        Self::call_orig(dirfd, pathname, mode)
+        VFS.mkdirat(dirfd, Path::from_cstr(pathname), mode)
     }
 }
 dlhooks::hook! {

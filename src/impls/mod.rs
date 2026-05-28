@@ -24,9 +24,9 @@ impl AsCStr for Path {}
 pub trait FromCStr {
     /// Create a Path object around the underlying given c buffer
     fn from_cstr<'a>(value: *const c_char) -> &'a Path {
-        // Note: We use strlen + 1 to consider the final \0 char. This ensures the final path
-        // can be directly "cast" to char* and used in the c routines
-        let byte_len = unsafe { libc::strlen(value) } + 1;
+        // VFS paths should not include the trailing C nul. Backends that call
+        // libc add their own nul terminator at that boundary.
+        let byte_len = unsafe { libc::strlen(value) };
         let bytes = unsafe { from_raw_parts(value as *const u8, byte_len) };
         let str = OsStr::from_bytes(bytes);
         Path::new(str)

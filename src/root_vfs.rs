@@ -134,6 +134,15 @@ impl RootVFS {
         self.fds.write().unwrap().remove(&fd);
     }
 
+    pub fn mkdirat(&self, dirfd: i32, path: &Path, mode: mode_t) -> i32 {
+        let Some(virtual_path) = self.resolve_openat_path(dirfd, path) else {
+            return -1;
+        };
+
+        let (fs, backend_path) = self.absolute_path_to_fs(virtual_path);
+        fs.mkdir(&backend_path, mode)
+    }
+
     /// Fill a Linux `getdents64` buffer for a tracked virtual directory fd.
     ///
     /// Returns `None` when `fd` is unknown or the underlying backend cannot
