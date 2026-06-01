@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fmt::Debug;
 use std::path::Path;
 
-use libc::mode_t;
+use libc::{mode_t, stat};
 
 /// Coarse file type exposed by VFS directory listings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +31,7 @@ pub trait LowLevelFS: Debug + Sync + Send + 'static {
     fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32;
     fn mkdir(&self, path: &Path, mode: mode_t) -> i32;
     fn chmod(&self, path: &Path, mode: mode_t) -> i32;
+    fn stat(&self, path: &Path, statbuf: &mut stat) -> i32;
 
     /// Return the direct children of `path` when the backend can enumerate it virtually.
     ///

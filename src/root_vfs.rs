@@ -7,9 +7,9 @@ use std::{
     sync::RwLock,
 };
 
-use libc::{c_void, mode_t, AT_FDCWD};
+use libc::{c_void, mode_t, stat, AT_FDCWD};
 
-use crate::filesystem::LowLevelFS;
+use crate::filesystem::{LowLevelFS, VfsDirEntry};
 use crate::linux_dirents;
 
 #[derive(Debug, Clone)]
@@ -134,6 +134,10 @@ impl RootVFS {
         self.fds.write().unwrap().remove(&fd);
     }
 
+    pub fn resolve_at(&self, dirfd: i32, path: &Path) -> Option<PathBuf> {
+        self.resolve_openat_path(dirfd, path)
+    }
+
     pub fn mkdirat(&self, dirfd: i32, path: &Path, mode: mode_t) -> i32 {
         let Some(virtual_path) = self.resolve_openat_path(dirfd, path) else {
             return -1;
@@ -141,6 +145,20 @@ impl RootVFS {
 
         let (fs, backend_path) = self.absolute_path_to_fs(virtual_path);
         fs.mkdir(&backend_path, mode)
+    }
+
+    pub fn fstat(&self, fd: i32, statbuf: &mut stat) -> Option<i32> {
+        let virtual_path = {
+            let fds = self.fds.read().unwrap();
+            fds.get(&fd)?.path.clone()
+        };
+
+        Some(self.stat(&virtual_path, statbuf))
+    }
+
+    pub fn read_dir(&self, path: &Path) -> Option<Vec<VfsDirEntry>> {
+        let (fs, path) = self.path_to_fs(path);
+        fs.read_dir(&path)
     }
 
     /// Fill a Linux `getdents64` buffer for a tracked virtual directory fd.
@@ -208,6 +226,11 @@ impl LowLevelFS for RootVFS {
     fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
         let (fs, path) = self.path_to_fs(path);
         fs.chmod(&path, mode)
+    }
+
+    fn stat(&self, path: &Path, statbuf: &mut stat) -> i32 {
+        let (fs, path) = self.path_to_fs(path);
+        fs.stat(&path, statbuf)
     }
 
     fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {

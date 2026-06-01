@@ -50,9 +50,7 @@ SANDBOX_VFS_UPPER="${upper}" \
 SANDBOX_VFS_MEMORY_MOUNT="/memFS" \
 LD_PRELOAD="${preload}" \
 python3 -c '
-import ctypes
 import os
-import struct
 
 mem_fs = os.environ["SANDBOX_VFS_MEMORY_MOUNT"]
 
@@ -60,23 +58,6 @@ fd = os.open(os.path.join(mem_fs, "file.txt"), os.O_CREAT | os.O_WRONLY, 0o644)
 os.close(fd)
 os.mkdir(os.path.join(mem_fs, "subdir"))
 
-fd = os.open(mem_fs, os.O_RDONLY)
-try:
-    buf = ctypes.create_string_buffer(1024)
-    written = ctypes.CDLL(None).getdents64(fd, buf, len(buf))
-finally:
-    os.close(fd)
-
-assert written > 0, written
-entries = []
-offset = 0
-while offset < written:
-    reclen = struct.unpack_from("H", buf.raw, offset + 16)[0]
-    name_start = offset + 19
-    name_end = buf.raw.index(b"\0", name_start)
-    entries.append(buf.raw[name_start:name_end].decode())
-    offset += reclen
-
-entries = sorted(name for name in entries if name not in (".", ".."))
+entries = sorted(os.listdir(mem_fs))
 assert entries == ["file.txt", "subdir"], entries
 '
