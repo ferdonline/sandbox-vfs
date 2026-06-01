@@ -2,7 +2,7 @@
 #![allow(unused)]
 
 use super::AsCStr;
-use libc::mode_t;
+use libc::{mode_t, stat};
 
 use crate::filesystem::LowLevelFS;
 #[cfg(all(target_os = "linux", feature = "hooks"))]
@@ -107,6 +107,18 @@ impl LowLevelFS for BindFS {
         #[cfg(any(not(target_os = "linux"), not(feature = "hooks")))]
         unsafe {
             libc::chmod(final_path.as_cstr(), mode)
+        }
+    }
+
+    fn stat(&self, pth: &Path, statbuf: &mut stat) -> i32 {
+        let final_path = self.translate_c_path(pth);
+        #[cfg(all(target_os = "linux", feature = "hooks"))]
+        unsafe {
+            libc_hooks::stat::call_orig(final_path.as_cstr(), statbuf)
+        }
+        #[cfg(any(not(target_os = "linux"), not(feature = "hooks")))]
+        unsafe {
+            libc::stat(final_path.as_cstr(), statbuf)
         }
     }
 

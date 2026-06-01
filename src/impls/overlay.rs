@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use libc::{mode_t, F_OK, O_APPEND, O_CREAT, O_RDWR, O_TRUNC, O_WRONLY};
+use libc::{mode_t, stat, F_OK, O_APPEND, O_CREAT, O_RDWR, O_TRUNC, O_WRONLY};
 
 use crate::filesystem::{LowLevelFS, VfsDirEntry};
 
@@ -120,6 +120,10 @@ impl LowLevelFS for OverlayFS {
 
     fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
         self.visible_layer(path).chmod(path, mode)
+    }
+
+    fn stat(&self, path: &Path, statbuf: &mut stat) -> i32 {
+        self.visible_layer(path).stat(path, statbuf)
     }
 
     fn read_dir(&self, path: &Path) -> Option<Vec<VfsDirEntry>> {

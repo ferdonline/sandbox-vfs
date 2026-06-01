@@ -3,23 +3,33 @@
 
 #![allow(unused)]
 
-use libc::{c_char, c_int, c_void, gid_t, mode_t, size_t, uid_t};
+use libc::{c_char, c_int, c_void, gid_t, mode_t, size_t, stat as stat_t, uid_t};
 
 use super::dlhooks;
-use crate::filesystem::LowLevelFS;
+use crate::filesystem::{LowLevelFS, VfsDirEntry, VfsEntryKind};
 use crate::root_vfs::RootVFS;
 use crate::{libc_hooks, BindFS, FromCStr, MemoryFS, OverlayFS};
 
 // use crate::impls::memory::ALL_MEM_FS;
 
+use std::collections::HashMap;
 use std::env;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, OnceLock, RwLock};
 
 const LOWER_ENV: &str = "SANDBOX_VFS_LOWER";
 const UPPER_ENV: &str = "SANDBOX_VFS_UPPER";
 const BACKEND_ENV: &str = "SANDBOX_VFS_BACKEND";
 const MEMORY_MOUNT_ENV: &str = "SANDBOX_VFS_MEMORY_MOUNT";
+
+#[derive(Debug)]
+struct MaterializedDir {
+    path: PathBuf,
+    entries: Vec<VfsDirEntry>,
+}
 
 static VFS: LazyLock<RootVFS> = LazyLock::new(|| {
     match env::var(BACKEND_ENV).as_deref() {
@@ -42,6 +52,9 @@ static VFS: LazyLock<RootVFS> = LazyLock::new(|| {
         None => root,
     }
 });
+static MATERIALIZED_DIRS: LazyLock<RwLock<HashMap<usize, MaterializedDir>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static NEXT_MATERIALIZED_DIR: AtomicU64 = AtomicU64::new(0);
 
 fn required_dir_from_env(name: &str) -> PathBuf {
     let value =
@@ -89,6 +102,40 @@ dlhooks::hook! {
     }
 }
 dlhooks::hook! {
+    unsafe fn stat(path: *const c_char, statbuf: *mut stat_t) -> c_int => {
+        VFS.stat(Path::from_cstr(path), &mut *statbuf)
+    }
+}
+dlhooks::hook! {
+    unsafe fn lstat(path: *const c_char, statbuf: *mut stat_t) -> c_int => {
+        VFS.stat(Path::from_cstr(path), &mut *statbuf)
+    }
+}
+dlhooks::hook! {
+    unsafe fn fstat(fd: c_int, statbuf: *mut stat_t) -> c_int => {
+        match VFS.fstat(fd, &mut *statbuf) {
+            Some(result) => result,
+            None => Self::call_orig(fd, statbuf),
+        }
+    }
+}
+dlhooks::hook! {
+    unsafe fn fstatat(dirfd: c_int, path: *const c_char, statbuf: *mut stat_t, flags: c_int) -> c_int => {
+        match VFS.resolve_at(dirfd, Path::from_cstr(path)) {
+            Some(path) => VFS.stat(&path, &mut *statbuf),
+            None => Self::call_orig(dirfd, path, statbuf, flags),
+        }
+    }
+}
+dlhooks::hook! {
+    unsafe fn newfstatat(dirfd: c_int, path: *const c_char, statbuf: *mut stat_t, flags: c_int) -> c_int => {
+        match VFS.resolve_at(dirfd, Path::from_cstr(path)) {
+            Some(path) => VFS.stat(&path, &mut *statbuf),
+            None => Self::call_orig(dirfd, path, statbuf, flags),
+        }
+    }
+}
+dlhooks::hook! {
     unsafe fn fchownat(dirfd: c_int, cpath: *const c_char, uid: uid_t, gid: gid_t, flags: c_int) -> c_int => {
         #[cfg(test)]
         libc::printf(b"> Intercepted fchownat with params: %d %s %d %d %d\0".as_ptr() as *const c_char, dirfd, cpath, uid, gid, flags);
@@ -131,6 +178,117 @@ dlhooks::hook! {
             None => Self::call_orig(fd, dirp, count),
         }
     }
+}
+dlhooks::hook! {
+    unsafe fn opendir(name: *const c_char) -> *mut libc::DIR => {
+        let path = Path::from_cstr(name);
+        if let Some(entries) = VFS.read_dir(path) {
+            if let Some(materialized) = materialize_dir(&entries) {
+                let c_path = path_to_cstring(&materialized.path);
+                let dirp = Self::call_orig(c_path.as_ptr());
+                if !dirp.is_null() {
+                    MATERIALIZED_DIRS
+                        .write()
+                        .unwrap()
+                        .insert(dirp as usize, materialized);
+                    return dirp;
+                }
+
+                cleanup_materialized_dir(&materialized);
+            }
+        }
+
+        Self::call_orig(name)
+    }
+}
+dlhooks::hook! {
+    unsafe fn closedir(dirp: *mut libc::DIR) -> c_int => {
+        let materialized = MATERIALIZED_DIRS.write().unwrap().remove(&(dirp as usize));
+        let result = Self::call_orig(dirp);
+        if let Some(materialized) = materialized {
+            cleanup_materialized_dir(&materialized);
+        }
+
+        result
+    }
+}
+
+fn materialize_dir(entries: &[VfsDirEntry]) -> Option<MaterializedDir> {
+    let path = PathBuf::from(format!(
+        "/tmp/sandbox-vfs-opendir-{}-{}",
+        std::process::id(),
+        NEXT_MATERIALIZED_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    let c_path = path_to_cstring(&path);
+
+    if unsafe { mkdir::call_orig(c_path.as_ptr(), 0o700) } != 0 {
+        return None;
+    }
+
+    let mut created = Vec::new();
+    for entry in entries {
+        if entry.name.as_bytes() == b"." || entry.name.as_bytes() == b".." {
+            continue;
+        }
+
+        let entry_path = path.join(&entry.name);
+        let c_entry_path = path_to_cstring(&entry_path);
+        let result = match entry.kind {
+            VfsEntryKind::Dir => unsafe { mkdir::call_orig(c_entry_path.as_ptr(), 0o700) },
+            VfsEntryKind::File => unsafe {
+                let fd = Open::call_orig(
+                    c_entry_path.as_ptr(),
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+                    0o600,
+                );
+                if fd < 0 {
+                    -1
+                } else {
+                    close::call_orig(fd)
+                }
+            },
+        };
+
+        if result != 0 {
+            cleanup_materialized_dir(&MaterializedDir {
+                path,
+                entries: created,
+            });
+            return None;
+        }
+
+        created.push(entry.clone());
+    }
+
+    Some(MaterializedDir {
+        path,
+        entries: created,
+    })
+}
+
+fn cleanup_materialized_dir(materialized: &MaterializedDir) {
+    for entry in materialized.entries.iter().rev() {
+        let entry_path = materialized.path.join(&entry.name);
+        let c_entry_path = path_to_cstring(&entry_path);
+        match entry.kind {
+            VfsEntryKind::Dir => unsafe {
+                libc::rmdir(c_entry_path.as_ptr());
+            },
+            VfsEntryKind::File => unsafe {
+                libc::unlink(c_entry_path.as_ptr());
+            },
+        }
+    }
+
+    let c_path = path_to_cstring(&materialized.path);
+    unsafe {
+        libc::rmdir(c_path.as_ptr());
+    }
+}
+
+fn path_to_cstring(path: &Path) -> CString {
+    CString::new(path.as_os_str().as_bytes())
+        .expect("paths with nul bytes cannot be passed to libc")
 }
 
 // NOTE: variadic arg functions are a bit pain since rust macros don't handle ...

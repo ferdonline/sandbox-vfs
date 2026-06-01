@@ -16,7 +16,7 @@ use std::{
 
 // use append_only_vec::AppendOnlyVec;
 
-use libc::{c_void, mode_t, O_CREAT};
+use libc::{c_void, mode_t, stat, O_CREAT};
 
 use crate::filesystem::{LowLevelFS, VfsDirEntry, VfsEntryKind};
 
@@ -206,6 +206,29 @@ impl LowLevelFS for MemoryFS {
             true => 0,
             false => -1,
         }
+    }
+
+    fn stat(&self, path: &Path, statbuf: &mut stat) -> i32 {
+        Self::assert_absolute(path);
+
+        let fs = self.fs.read().unwrap();
+        let Some(entry) = fs.get(path) else {
+            return -1;
+        };
+
+        *statbuf = unsafe { std::mem::zeroed() };
+        statbuf.st_mode = match entry.kind {
+            FileKind::File => libc::S_IFREG | 0o644,
+            FileKind::Dir => libc::S_IFDIR | 0o755,
+        };
+        statbuf.st_nlink = match entry.kind {
+            FileKind::File => 1,
+            FileKind::Dir => 2,
+        };
+        statbuf.st_ino = calculate_hash_seq(path.as_os_str().as_bytes()) as _;
+        statbuf.st_size = 0;
+        statbuf.st_blksize = 4096;
+        0
     }
 
     fn read_dir(&self, path: &Path) -> Option<Vec<VfsDirEntry>> {
