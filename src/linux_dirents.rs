@@ -24,10 +24,12 @@ pub fn dot_entries() -> [VfsDirEntry; 2] {
         VfsDirEntry {
             name: OsString::from("."),
             kind: VfsEntryKind::Dir,
+            ino: None,
         },
         VfsDirEntry {
             name: OsString::from(".."),
             kind: VfsEntryKind::Dir,
+            ino: None,
         },
     ]
 }
@@ -70,7 +72,7 @@ pub unsafe fn write_dirents64(
         }
 
         let entry_path = entry_path(parent_path, &entry.name);
-        let ino = inode_for_path(&entry_path);
+        let ino = entry.ino.unwrap_or_else(|| inode_for_path(&entry_path));
         let next_offset = (start_offset + consumed + 1) as i64;
 
         unsafe {
