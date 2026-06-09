@@ -16,16 +16,17 @@ use std::{
 
 use libc::{mode_t, stat, O_CREAT};
 
-use crate::filesystem::{LowLevelFS, VfsDirEntry, VfsEntryKind};
+use crate::filesystem::{LowLevelFS, OpenResult, OpenedFile, VfsDirEntry, VfsEntryKind};
 
 type NodeId = u64;
+type NodeMap = Arc<RwLock<HashMap<NodeId, Arc<Node>>>>;
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct MemoryFS {
     id: String,
     root: NodeId,
-    nodes: RwLock<HashMap<NodeId, Arc<Node>>>,
+    nodes: NodeMap,
 }
 
 #[derive(Debug)]
@@ -44,6 +45,22 @@ enum NodeKind {
         entries: RwLock<BTreeMap<OsString, NodeId>>,
         placeholder_fd: RawFd,
     },
+}
+
+#[derive(Debug)]
+struct MemoryOpenedFile {
+    node: Arc<Node>,
+    nodes: NodeMap,
+}
+
+impl OpenedFile for MemoryOpenedFile {
+    fn stat(&self, statbuf: &mut stat) -> i32 {
+        stat_node(&self.node, &self.nodes, statbuf)
+    }
+
+    fn read_dir(&self) -> Option<Vec<VfsDirEntry>> {
+        read_node_dir(&self.node, &self.nodes)
+    }
 }
 
 impl Node {
@@ -124,7 +141,7 @@ impl MemoryFS {
         Box::new(Self {
             id: id.into(),
             root: root_id,
-            nodes: RwLock::new(nodes),
+            nodes: Arc::new(RwLock::new(nodes)),
         })
     }
 
@@ -195,6 +212,37 @@ impl MemoryFS {
         entries.insert(name.to_os_string(), id);
         Some(node)
     }
+
+    fn open_node(&self, path: &Path, flags: i32, mode: mode_t) -> (RawFd, Option<Arc<Node>>) {
+        Self::assert_absolute(path);
+        let existing = self.resolve(path);
+        if existing.is_some()
+            && flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL
+        {
+            return (-1, None);
+        }
+
+        let node = match existing {
+            Some(node) => node,
+            None if flags & O_CREAT != 0 => {
+                let Some(node) = self.create_node(path, VfsEntryKind::File, mode) else {
+                    return (-1, None);
+                };
+                node
+            }
+            None => return (-1, None),
+        };
+
+        if flags & libc::O_DIRECTORY != 0 && !matches!(node.kind, NodeKind::Directory { .. }) {
+            return (-1, None);
+        }
+
+        let fd = open_backing(node.backing_fd(), flags);
+        if fd < 0 {
+            return (fd, None);
+        }
+        (fd, Some(node))
+    }
 }
 
 impl NodeKind {
@@ -204,6 +252,60 @@ impl NodeKind {
             Self::Directory { placeholder_fd, .. } => *placeholder_fd,
         }
     }
+}
+
+fn node_from_map(nodes: &NodeMap, id: NodeId) -> Option<Arc<Node>> {
+    nodes.read().unwrap().get(&id).cloned()
+}
+
+fn stat_node(node: &Node, nodes: &NodeMap, statbuf: &mut stat) -> i32 {
+    *statbuf = unsafe { std::mem::zeroed() };
+    if matches!(node.kind, NodeKind::File { .. }) {
+        unsafe {
+            libc::fstat(node.backing_fd(), statbuf);
+        }
+    }
+    statbuf.st_mode = match node.kind {
+        NodeKind::File { .. } => libc::S_IFREG,
+        NodeKind::Directory { .. } => libc::S_IFDIR,
+    } | *node.mode.read().unwrap();
+    statbuf.st_ino = node.id as _;
+    statbuf.st_nlink = match node.kind {
+        NodeKind::File { .. } => 1,
+        NodeKind::Directory { ref entries, .. } => {
+            2 + entries
+                .read()
+                .unwrap()
+                .values()
+                .filter(|id| {
+                    node_from_map(nodes, **id)
+                        .is_some_and(|node| matches!(node.kind, NodeKind::Directory { .. }))
+                })
+                .count() as libc::nlink_t
+        }
+    };
+    statbuf.st_blksize = 4096;
+    0
+}
+
+fn read_node_dir(node: &Node, nodes: &NodeMap) -> Option<Vec<VfsDirEntry>> {
+    let NodeKind::Directory { entries, .. } = &node.kind else {
+        return None;
+    };
+
+    entries
+        .read()
+        .unwrap()
+        .iter()
+        .map(|(name, id)| {
+            let node = node_from_map(nodes, *id)?;
+            Some(VfsDirEntry {
+                name: name.clone(),
+                kind: node.entry_kind(),
+                ino: Some(node.id),
+            })
+        })
+        .collect()
 }
 
 impl LowLevelFS for MemoryFS {
@@ -216,29 +318,20 @@ impl LowLevelFS for MemoryFS {
     }
 
     fn open(&self, path: &Path, flags: i32, mode: mode_t) -> RawFd {
-        Self::assert_absolute(path);
-        let existing = self.resolve(path);
-        if existing.is_some()
-            && flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL
-        {
-            return -1;
-        }
+        self.open_node(path, flags, mode).0
+    }
 
-        let node = match existing {
-            Some(node) => node,
-            None if flags & O_CREAT != 0 => {
-                let Some(node) = self.create_node(path, VfsEntryKind::File, mode) else {
-                    return -1;
-                };
-                node
-            }
-            None => return -1,
-        };
-
-        if flags & libc::O_DIRECTORY != 0 && !matches!(node.kind, NodeKind::Directory { .. }) {
-            return -1;
+    fn open_with_handle(&self, path: &Path, flags: i32, mode: mode_t) -> OpenResult {
+        let (fd, node) = self.open_node(path, flags, mode);
+        OpenResult {
+            fd,
+            opened: node.map(|node| {
+                Arc::new(MemoryOpenedFile {
+                    node,
+                    nodes: self.nodes.clone(),
+                }) as Arc<dyn OpenedFile>
+            }),
         }
-        open_backing(node.backing_fd(), flags)
     }
 
     fn openat(&self, _dirfd: i32, path: &Path, flags: i32, mode: mode_t) -> i32 {
@@ -268,56 +361,12 @@ impl LowLevelFS for MemoryFS {
         let Some(node) = self.resolve(path) else {
             return -1;
         };
-
-        *statbuf = unsafe { std::mem::zeroed() };
-        if matches!(node.kind, NodeKind::File { .. }) {
-            unsafe {
-                libc::fstat(node.backing_fd(), statbuf);
-            }
-        }
-        statbuf.st_mode = match node.kind {
-            NodeKind::File { .. } => libc::S_IFREG,
-            NodeKind::Directory { .. } => libc::S_IFDIR,
-        } | *node.mode.read().unwrap();
-        statbuf.st_ino = node.id as _;
-        statbuf.st_nlink = match node.kind {
-            NodeKind::File { .. } => 1,
-            NodeKind::Directory { ref entries, .. } => {
-                2 + entries
-                    .read()
-                    .unwrap()
-                    .values()
-                    .filter(|id| {
-                        self.node(**id)
-                            .is_some_and(|node| matches!(node.kind, NodeKind::Directory { .. }))
-                    })
-                    .count() as libc::nlink_t
-            }
-        };
-        statbuf.st_blksize = 4096;
-        0
+        stat_node(&node, &self.nodes, statbuf)
     }
 
     fn read_dir(&self, path: &Path) -> Option<Vec<VfsDirEntry>> {
         let node = self.resolve(path)?;
-        let NodeKind::Directory { entries, .. } = &node.kind else {
-            return None;
-        };
-
-        let result = entries
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(name, id)| {
-                let node = self.node(*id)?;
-                Some(VfsDirEntry {
-                    name: name.clone(),
-                    kind: node.entry_kind(),
-                    ino: Some(node.id),
-                })
-            })
-            .collect();
-        result
+        read_node_dir(&node, &self.nodes)
     }
 }
 

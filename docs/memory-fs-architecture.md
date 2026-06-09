@@ -110,25 +110,32 @@ Metadata ownership is intentionally split:
 `MemoryFS::stat()` starts with `fstat()` for regular files, then overlays
 virtual metadata such as the node ID, link count, kind, and mode.
 
-## Current Limitation
+## Open Descriptor Tracking
 
-`MemoryFS` now has node identity, but `RootVFS` still tracks open descriptors by
-virtual path:
-
-```text
-fd -> virtual path
-```
-
-That works for current operations, but it cannot fully represent an open file
-after its path is renamed or unlinked.
-
-The next architectural step is to track an opened backend object or node
-alongside the path:
+`RootVFS` tracks both the virtual path used to open a descriptor and an optional
+backend-owned opened-file handle:
 
 ```text
-fd -> opened node/backend handle
+fd -> {
+    virtual path,
+    opened backend object,
+    directory offset
+}
 ```
 
-Once that exists, an unlinked node can remain usable through existing open
-descriptors until the final reference is closed, matching normal Unix
-filesystem behavior.
+The virtual path remains useful for resolving relative `openat()` calls.
+Operations that act on the already-opened object, such as `fstat()` and
+`getdents64()`, use the backend-owned handle instead.
+
+For `MemoryFS`, the handle retains an `Arc` to the opened node. It therefore
+continues to identify the same node even if its original path becomes stale.
+When unlink support is added, this will allow an unlinked node to remain usable
+through existing open descriptors until the final reference is closed,
+matching normal Unix filesystem behavior.
+
+Backends that rely entirely on real kernel descriptors do not need to provide a
+virtual opened-file handle.
+
+Relative `openat()` resolution is still path-based. A future stage should allow
+capable backend handles to resolve children directly so an opened directory
+continues to work as an `openat()` base after that directory is renamed.
