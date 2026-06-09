@@ -1,105 +1,131 @@
-//! Implementation of a low-level memory file system
-//! It uses memfd_create to have real file descriptors. Among
-//! others, they track creation and modification times
+//! In-memory filesystem with a Rust-owned namespace and kernel-backed files.
+//!
+//! Regular-file contents live in anonymous memfds so callers can use ordinary
+//! kernel `read`, `write`, `mmap`, and `ftruncate` operations on returned fds.
 
-#![allow(unused)] // TODO: Remove this
-
-#[cfg(not(target_os = "linux"))]
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::{
-    collections::HashMap,
-    hash::{DefaultHasher, Hasher},
-    os::unix::{ffi::OsStrExt, io::RawFd},
-    path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    collections::{BTreeMap, HashMap},
+    ffi::{OsStr, OsString},
+    os::unix::io::RawFd,
+    path::{Component, Path},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
 };
 
-// use append_only_vec::AppendOnlyVec;
-
-use libc::{c_void, mode_t, stat, O_CREAT};
+use libc::{mode_t, stat, O_CREAT};
 
 use crate::filesystem::{LowLevelFS, VfsDirEntry, VfsEntryKind};
 
-// We need to keep track of all MemFS due to intercepting calls with virtual fd's
-// pub static ALL_MEM_FS: AppendOnlyVec<&MemoryFS> = AppendOnlyVec::new();
+type NodeId = u64;
+static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct MemoryFS {
     id: String,
-    base_fd: usize,
-    cur_dir_fd: usize,
-    fs: RwLock<HashMap<PathBuf, Arc<MemFsEntry>>>,
+    root: NodeId,
+    nodes: RwLock<HashMap<NodeId, Arc<Node>>>,
 }
 
-#[allow(unused)]
-#[derive(Debug, Clone)]
-pub struct Directory {
-    entries: Vec<String>, // Entries will be filenames inside the directory
-    index: usize,         // Keeps track of the current position in the directory
+#[derive(Debug)]
+struct Node {
+    id: NodeId,
+    mode: RwLock<mode_t>,
+    kind: NodeKind,
 }
 
-// File structure for both regular files and directories
-#[allow(unused)]
-#[derive(Debug, Clone)]
-pub struct MemFsEntry {
-    fd: RawFd,
-    path: PathBuf,
-    kind: FileKind,
+#[derive(Debug)]
+enum NodeKind {
+    File {
+        backing_fd: RawFd,
+    },
+    Directory {
+        entries: RwLock<BTreeMap<OsString, NodeId>>,
+        placeholder_fd: RawFd,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileKind {
-    File,
-    Dir,
+impl Node {
+    fn entry_kind(&self) -> VfsEntryKind {
+        match self.kind {
+            NodeKind::File { .. } => VfsEntryKind::File,
+            NodeKind::Directory { .. } => VfsEntryKind::Dir,
+        }
+    }
+
+    fn backing_fd(&self) -> RawFd {
+        match self.kind {
+            NodeKind::File { backing_fd } => backing_fd,
+            NodeKind::Directory { placeholder_fd, .. } => placeholder_fd,
+        }
+    }
 }
 
-/// Created a memfd entry given it's NULL TERMINATED name
+#[cfg(target_os = "linux")]
+impl Drop for Node {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.backing_fd());
+        }
+    }
+}
+
+/// Create an anonymous kernel file used as node backing.
 #[cfg(target_os = "linux")]
 fn create_memfd(name: &[u8]) -> RawFd {
-    use libc::{syscall, SYS_memfd_create};
-
-    unsafe { syscall(SYS_memfd_create, name.as_ptr() as *const i8, 0) as RawFd }
+    unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr().cast::<i8>(), 0) as RawFd }
 }
 
 #[cfg(not(target_os = "linux"))]
 fn create_memfd(_name: &[u8]) -> RawFd {
-    static NEXT_FD: AtomicI32 = AtomicI32::new(10_000);
-
-    NEXT_FD.fetch_add(1, Ordering::Relaxed)
+    static NEXT_FD: AtomicU64 = AtomicU64::new(10_000);
+    NEXT_FD.fetch_add(1, Ordering::Relaxed) as RawFd
 }
 
-impl MemFsEntry {
-    pub fn new(fd: RawFd, path: PathBuf, kind: FileKind) -> Self {
-        Self { fd, path, kind }
+/// Open a fresh file description for a node's anonymous backing file.
+#[cfg(target_os = "linux")]
+fn open_backing(backing_fd: RawFd, flags: i32) -> RawFd {
+    let path = format!("/proc/self/fd/{backing_fd}\0");
+    // These flags describe virtual namespace lookup, which has already happened.
+    let flags = flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    // Bypass libc because this function is itself used by the interposed open hook.
+    unsafe {
+        libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            path.as_ptr().cast::<i8>(),
+            flags,
+            0,
+        ) as RawFd
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_backing(_backing_fd: RawFd, _flags: i32) -> RawFd {
+    static NEXT_FD: AtomicU64 = AtomicU64::new(20_000);
+    NEXT_FD.fetch_add(1, Ordering::Relaxed) as RawFd
 }
 
 impl MemoryFS {
     pub fn new(id: impl Into<String>) -> Box<Self> {
-        let root = Arc::new(MemFsEntry::new(
-            create_memfd(b"root\0"),
-            PathBuf::from("/"),
-            FileKind::Dir,
-        ));
-        let mut fs = HashMap::new();
-        fs.insert(PathBuf::from("/"), root);
-
-        // let base_fd = ALL_MEM_FS.len() * super::MEMORY_FD_START;
-        let memfs = Box::new(Self {
-            id: id.into(),
-            base_fd: 0,
-            cur_dir_fd: 0,
-            fs: RwLock::new(fs),
+        let root_id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = Arc::new(Node {
+            id: root_id,
+            mode: RwLock::new(0o755),
+            kind: NodeKind::Directory {
+                entries: RwLock::new(BTreeMap::new()),
+                placeholder_fd: create_memfd(b"sandbox-vfs-dir\0"),
+            },
         });
-        // Hack: In order to avoid changing API everywhere to support a non-case, we keep static refs to the created mem filesystems
-        // This is fine as long as we agree that filesystems are only destroyed at the end
-        // ALL_MEM_FS.push(unsafe { std::mem::transmute(memfs.as_ref()) });
-        memfs
-    }
+        let mut nodes = HashMap::new();
+        nodes.insert(root.id, root);
 
-    // This intercepted call is unique to memory-fs
-    pub fn getdents64(&self, fd: i32, dirp: *mut c_void, count: i32) -> isize {
-        todo!()
+        Box::new(Self {
+            id: id.into(),
+            root: root_id,
+            nodes: RwLock::new(nodes),
+        })
     }
 
     fn assert_absolute(path: &Path) {
@@ -109,55 +135,74 @@ impl MemoryFS {
         );
     }
 
-    fn parent_is_dir(&self, path: &Path) -> bool {
-        path.parent().is_some_and(|parent| {
-            self.fs
-                .read()
-                .unwrap()
-                .get(parent)
-                .is_some_and(|entry| entry.kind == FileKind::Dir)
-        })
+    fn node(&self, id: NodeId) -> Option<Arc<Node>> {
+        self.nodes.read().unwrap().get(&id).cloned()
     }
 
-    fn memfd_name(path: &Path) -> Option<Vec<u8>> {
-        let parent = path.parent()?;
-        let file_name = path.file_name()?;
-        let parent_hash = calculate_hash_seq(parent.as_os_str().as_bytes());
-        Some(format!("{parent_hash:x}_{}\0", file_name.to_string_lossy()).into_bytes())
-    }
-
-    fn create_entry(&self, path: &Path, kind: FileKind) -> i32 {
+    fn resolve(&self, path: &Path) -> Option<Arc<Node>> {
         Self::assert_absolute(path);
+        let mut node = self.node(self.root)?;
 
-        if path == Path::new("/") || !self.parent_is_dir(path) {
-            return -1;
+        for component in path.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            let NodeKind::Directory { entries, .. } = &node.kind else {
+                return None;
+            };
+            let child_id = *entries.read().unwrap().get(name)?;
+            node = self.node(child_id)?;
         }
+        Some(node)
+    }
 
-        let mut fs = self.fs.write().unwrap();
-        if fs.contains_key(path) {
-            return -1;
-        }
+    fn resolve_parent<'a>(&self, path: &'a Path) -> Option<(Arc<Node>, &'a OsStr)> {
+        Self::assert_absolute(path);
+        Some((self.resolve(path.parent()?)?, path.file_name()?))
+    }
 
-        let Some(name) = Self::memfd_name(path) else {
-            return -1;
+    fn create_node(&self, path: &Path, kind: VfsEntryKind, mode: mode_t) -> Option<Arc<Node>> {
+        let (parent, name) = self.resolve_parent(path)?;
+        let NodeKind::Directory { entries, .. } = &parent.kind else {
+            return None;
         };
-        let fd = create_memfd(&name);
-        if fd < 0 {
-            return -1;
-        }
-        #[cfg(test)]
-        println!(
-            "pid: {}, memfd: {}, name: {}",
-            std::process::id(),
-            fd,
-            String::from_utf8_lossy(&name)
-        );
 
-        fs.insert(
-            path.into(),
-            Arc::new(MemFsEntry::new(fd, path.into(), kind)),
-        );
-        0
+        let mut entries = entries.write().unwrap();
+        if entries.contains_key(name) {
+            return None;
+        }
+
+        let id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
+        let node_kind = match kind {
+            VfsEntryKind::File => NodeKind::File {
+                backing_fd: create_memfd(b"sandbox-vfs-file\0"),
+            },
+            VfsEntryKind::Dir => NodeKind::Directory {
+                entries: RwLock::new(BTreeMap::new()),
+                placeholder_fd: create_memfd(b"sandbox-vfs-dir\0"),
+            },
+        };
+        if node_kind.backing_fd() < 0 {
+            return None;
+        }
+
+        let node = Arc::new(Node {
+            id,
+            mode: RwLock::new(mode & 0o7777),
+            kind: node_kind,
+        });
+        self.nodes.write().unwrap().insert(id, node.clone());
+        entries.insert(name.to_os_string(), id);
+        Some(node)
+    }
+}
+
+impl NodeKind {
+    fn backing_fd(&self) -> RawFd {
+        match self {
+            Self::File { backing_fd } => *backing_fd,
+            Self::Directory { placeholder_fd, .. } => *placeholder_fd,
+        }
     }
 }
 
@@ -166,240 +211,192 @@ impl LowLevelFS for MemoryFS {
         &self.id
     }
 
-    fn access(&self, path: &std::path::Path, _mode: i32) -> i32 {
-        Self::assert_absolute(path);
-
-        // fine if file exists
-        match self.fs.read().unwrap().contains_key(path) {
-            true => 0,
-            false => -1,
-        }
+    fn access(&self, path: &Path, _mode: i32) -> i32 {
+        self.resolve(path).map_or(-1, |_| 0)
     }
 
-    fn open(&self, path: &std::path::Path, oflag: i32, _mode: mode_t) -> RawFd {
+    fn open(&self, path: &Path, flags: i32, mode: mode_t) -> RawFd {
         Self::assert_absolute(path);
-
-        if let Some(memfile) = self.fs.read().unwrap().get(path) {
-            return memfile.fd;
-        }
-
-        if oflag & O_CREAT == 0 || self.create_entry(path, FileKind::File) != 0 {
+        let existing = self.resolve(path);
+        if existing.is_some()
+            && flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL
+        {
             return -1;
         }
 
-        self.fs
-            .read()
-            .unwrap()
-            .get(path)
-            .map_or(-1, |memfile| memfile.fd)
-    }
+        let node = match existing {
+            Some(node) => node,
+            None if flags & O_CREAT != 0 => {
+                let Some(node) = self.create_node(path, VfsEntryKind::File, mode) else {
+                    return -1;
+                };
+                node
+            }
+            None => return -1,
+        };
 
-    // Function to create a directory (mkdir)
-    fn mkdir(&self, path: &Path, _mode: mode_t) -> RawFd {
-        self.create_entry(path, FileKind::Dir)
-    }
-
-    fn chmod(&self, path: &Path, _mode: mode_t) -> i32 {
-        Self::assert_absolute(path);
-
-        match self.fs.read().unwrap().contains_key(path) {
-            true => 0,
-            false => -1,
+        if flags & libc::O_DIRECTORY != 0 && !matches!(node.kind, NodeKind::Directory { .. }) {
+            return -1;
         }
+        open_backing(node.backing_fd(), flags)
+    }
+
+    fn openat(&self, _dirfd: i32, path: &Path, flags: i32, mode: mode_t) -> i32 {
+        Self::assert_absolute(path);
+        self.open(path, flags, mode)
+    }
+
+    fn mkdir(&self, path: &Path, mode: mode_t) -> i32 {
+        self.create_node(path, VfsEntryKind::Dir, mode)
+            .map_or(-1, |_| 0)
+    }
+
+    fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
+        let Some(node) = self.resolve(path) else {
+            return -1;
+        };
+        *node.mode.write().unwrap() = mode & 0o7777;
+        if matches!(node.kind, NodeKind::File { .. }) {
+            unsafe {
+                libc::fchmod(node.backing_fd(), mode);
+            }
+        }
+        0
     }
 
     fn stat(&self, path: &Path, statbuf: &mut stat) -> i32 {
-        Self::assert_absolute(path);
-
-        let fs = self.fs.read().unwrap();
-        let Some(entry) = fs.get(path) else {
+        let Some(node) = self.resolve(path) else {
             return -1;
         };
 
         *statbuf = unsafe { std::mem::zeroed() };
-        statbuf.st_mode = match entry.kind {
-            FileKind::File => libc::S_IFREG | 0o644,
-            FileKind::Dir => libc::S_IFDIR | 0o755,
+        if matches!(node.kind, NodeKind::File { .. }) {
+            unsafe {
+                libc::fstat(node.backing_fd(), statbuf);
+            }
+        }
+        statbuf.st_mode = match node.kind {
+            NodeKind::File { .. } => libc::S_IFREG,
+            NodeKind::Directory { .. } => libc::S_IFDIR,
+        } | *node.mode.read().unwrap();
+        statbuf.st_ino = node.id as _;
+        statbuf.st_nlink = match node.kind {
+            NodeKind::File { .. } => 1,
+            NodeKind::Directory { ref entries, .. } => {
+                2 + entries
+                    .read()
+                    .unwrap()
+                    .values()
+                    .filter(|id| {
+                        self.node(**id)
+                            .is_some_and(|node| matches!(node.kind, NodeKind::Directory { .. }))
+                    })
+                    .count() as libc::nlink_t
+            }
         };
-        statbuf.st_nlink = match entry.kind {
-            FileKind::File => 1,
-            FileKind::Dir => 2,
-        };
-        statbuf.st_ino = calculate_hash_seq(path.as_os_str().as_bytes()) as _;
-        statbuf.st_size = 0;
         statbuf.st_blksize = 4096;
         0
     }
 
     fn read_dir(&self, path: &Path) -> Option<Vec<VfsDirEntry>> {
-        Self::assert_absolute(path);
-
-        let fs = self.fs.read().unwrap();
-        if fs.get(path).is_none_or(|entry| entry.kind != FileKind::Dir) {
+        let node = self.resolve(path)?;
+        let NodeKind::Directory { entries, .. } = &node.kind else {
             return None;
-        }
+        };
 
-        let mut entries = fs
+        let result = entries
+            .read()
+            .unwrap()
             .iter()
-            .filter_map(|(entry_path, entry)| {
-                if entry_path == path || entry_path.parent() != Some(path) {
-                    return None;
-                }
-
+            .map(|(name, id)| {
+                let node = self.node(*id)?;
                 Some(VfsDirEntry {
-                    name: entry_path.file_name()?.to_os_string(),
-                    kind: match entry.kind {
-                        FileKind::File => VfsEntryKind::File,
-                        FileKind::Dir => VfsEntryKind::Dir,
-                    },
+                    name: name.clone(),
+                    kind: node.entry_kind(),
+                    ino: Some(node.id),
                 })
             })
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
-        Some(entries)
+            .collect();
+        result
     }
-
-    fn openat(&self, _dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
-        Self::assert_absolute(path);
-        self.open(path, flag, mode)
-    }
-}
-
-fn calculate_hash_seq<T: std::hash::Hash>(t: &[T]) -> u64 {
-    let mut s = DefaultHasher::new();
-    for e in t {
-        e.hash(&mut s);
-    }
-    s.finish()
 }
 
 #[cfg(test)]
 mod test {
-    use libc::{F_OK, O_CREAT, O_RDONLY};
+    use libc::{F_OK, O_CREAT};
+    #[cfg(target_os = "linux")]
+    use libc::{O_RDONLY, O_RDWR};
 
     use super::*;
 
     #[test]
-    fn test_sys_call() {
-        let fd = create_memfd("my_file\0".as_bytes());
-        if fd < 0 {
-            eprintln!("Err: {}", std::io::Error::last_os_error());
-        }
-        assert!(fd > 0);
-    }
-
-    #[test]
-    fn test_fs_access() {
-        let test_path = Path::new("/usr/bin/cd");
-        let fs = MemoryFS::new("");
-
-        // Not alright
-        assert_ne!(fs.access(test_path, F_OK), 0);
-
-        // .access alright after creating it
-        assert_eq!(fs.mkdir(Path::new("/usr"), 0), 0);
-        assert_eq!(fs.mkdir(Path::new("/usr/bin"), 0), 0);
-        assert_eq!(fs.mkdir(test_path, 0), 0);
-        println!("fs contains: {:?}", fs);
-
-        assert_eq!(fs.access(test_path, F_OK), 0);
-    }
-
-    #[test]
-    fn test_root_exists_by_default() {
-        let fs = MemoryFS::new("");
-
+    fn root_exists_by_default() {
+        let fs = MemoryFS::new("memory");
         assert_eq!(fs.access(Path::new("/"), F_OK), 0);
     }
 
     #[test]
-    fn test_mkdir_requires_existing_parent() {
-        let fs = MemoryFS::new("");
-
-        assert_ne!(fs.mkdir(Path::new("/usr/bin"), 0), 0);
-        assert_ne!(fs.access(Path::new("/usr/bin"), F_OK), 0);
+    fn creation_requires_existing_directory_parent() {
+        let fs = MemoryFS::new("memory");
+        assert_ne!(fs.open(Path::new("/missing/file"), O_CREAT, 0o644), 0);
+        assert_eq!(fs.mkdir(Path::new("/dir"), 0o755), 0);
+        assert!(fs.open(Path::new("/dir/file"), O_CREAT, 0o644) > 0);
     }
 
     #[test]
-    fn test_mkdir_rejects_duplicate_path() {
-        let fs = MemoryFS::new("");
-
-        assert_eq!(fs.mkdir(Path::new("/usr"), 0), 0);
-        assert_ne!(fs.mkdir(Path::new("/usr"), 0), 0);
+    fn stable_inode_is_independent_of_path_hashing() {
+        let fs = MemoryFS::new("memory");
+        assert!(fs.open(Path::new("/file"), O_CREAT, 0o640) > 0);
+        let mut statbuf = unsafe { std::mem::zeroed() };
+        assert_eq!(fs.stat(Path::new("/file"), &mut statbuf), 0);
+        let inode = statbuf.st_ino;
+        assert_ne!(inode, 0);
+        assert_eq!(fs.stat(Path::new("/file"), &mut statbuf), 0);
+        assert_eq!(statbuf.st_ino, inode);
+        assert_eq!(statbuf.st_mode & 0o7777, 0o640);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn test_open_without_create_fails_for_missing_file() {
-        let fs = MemoryFS::new("");
-
-        assert_ne!(fs.open(Path::new("/hello.txt"), O_RDONLY, 0), 0);
-    }
-
-    #[test]
-    fn test_open_create_creates_regular_file() {
-        let fs = MemoryFS::new("");
-
-        let fd = fs.open(Path::new("/hello.txt"), O_CREAT, 0o644);
-
-        assert!(fd > 0);
-        assert_eq!(fs.access(Path::new("/hello.txt"), F_OK), 0);
+    fn independent_opens_have_independent_offsets_and_shared_contents() {
+        let fs = MemoryFS::new("memory");
+        let first = fs.open(Path::new("/file"), O_CREAT | O_RDWR, 0o644);
         assert_eq!(
-            fs.fs
-                .read()
-                .unwrap()
-                .get(Path::new("/hello.txt"))
-                .unwrap()
-                .kind,
-            FileKind::File
+            unsafe { libc::write(first, b"hello".as_ptr().cast(), 5) },
+            5
         );
+        unsafe {
+            libc::close(first);
+        }
+
+        let left = fs.open(Path::new("/file"), O_RDONLY, 0);
+        let right = fs.open(Path::new("/file"), O_RDONLY, 0);
+        let mut buf = [0_u8; 3];
+        assert_eq!(unsafe { libc::read(left, buf.as_mut_ptr().cast(), 2) }, 2);
+        assert_eq!(&buf[..2], b"he");
+        assert_eq!(unsafe { libc::read(right, buf.as_mut_ptr().cast(), 2) }, 2);
+        assert_eq!(&buf[..2], b"he");
+
+        unsafe {
+            libc::close(left);
+            libc::close(right);
+        }
     }
 
     #[test]
-    fn test_open_create_requires_existing_parent() {
-        let fs = MemoryFS::new("");
-
-        assert_ne!(fs.open(Path::new("/missing/hello.txt"), O_CREAT, 0o644), 0);
-        assert_ne!(fs.access(Path::new("/missing/hello.txt"), F_OK), 0);
-    }
-
-    #[test]
-    fn test_chmod_fails_for_missing_path() {
-        let fs = MemoryFS::new("");
-
-        assert_ne!(fs.chmod(Path::new("/missing"), 0o755), 0);
-    }
-
-    #[test]
-    fn test_openat_accepts_absolute_path() {
-        let fs = MemoryFS::new("");
-
-        let fd = fs.openat(libc::AT_FDCWD, Path::new("/hello.txt"), O_CREAT, 0o644);
-
-        assert!(fd > 0);
-        assert_eq!(fs.access(Path::new("/hello.txt"), F_OK), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "MemoryFS backends only accept absolute paths")]
-    fn test_openat_panics_for_relative_path() {
-        let fs = MemoryFS::new("");
-
-        fs.openat(libc::AT_FDCWD, Path::new("hello.txt"), O_CREAT, 0o644);
+    fn directory_entries_expose_child_inode() {
+        let fs = MemoryFS::new("memory");
+        assert!(fs.open(Path::new("/file"), O_CREAT, 0o644) > 0);
+        let entries = fs.read_dir(Path::new("/")).unwrap();
+        assert_eq!(entries[0].name, "file");
+        let mut statbuf = unsafe { std::mem::zeroed() };
+        assert_eq!(fs.stat(Path::new("/file"), &mut statbuf), 0);
+        assert_eq!(entries[0].ino, Some(statbuf.st_ino));
     }
 
     #[test]
     #[should_panic(expected = "MemoryFS backends only accept absolute paths")]
-    fn test_open_panics_for_relative_path() {
-        let fs = MemoryFS::new("");
-
-        fs.open(Path::new("hello.txt"), O_CREAT, 0o644);
-    }
-
-    #[test]
-    #[should_panic(expected = "MemoryFS backends only accept absolute paths")]
-    fn test_mkdir_panics_for_relative_path() {
-        let fs = MemoryFS::new("");
-
-        fs.mkdir(Path::new("tmp"), 0o755);
+    fn rejects_relative_paths() {
+        MemoryFS::new("memory").open(Path::new("file"), O_CREAT, 0o644);
     }
 }

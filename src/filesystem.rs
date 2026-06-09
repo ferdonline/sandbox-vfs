@@ -20,6 +20,8 @@ pub enum VfsEntryKind {
 pub struct VfsDirEntry {
     pub name: OsString,
     pub kind: VfsEntryKind,
+    /// Backend-provided inode number, when the backend has stable node identity.
+    pub ino: Option<u64>,
 }
 
 /// File system implementations must implement this trait
