@@ -2,7 +2,7 @@ use std::path::Path;
 
 use libc::{mode_t, stat, F_OK, O_APPEND, O_CREAT, O_RDWR, O_TRUNC, O_WRONLY};
 
-use crate::filesystem::{LowLevelFS, VfsDirEntry};
+use crate::filesystem::{LowLevelFS, OpenResult, VfsDirEntry};
 
 /// A purely virtual overlay FS
 #[allow(unused)]
@@ -107,6 +107,16 @@ impl LowLevelFS for OverlayFS {
         self.visible_layer(path).open(path, oflag, mode)
     }
 
+    fn open_with_handle(&self, path: &Path, oflag: i32, mode: mode_t) -> OpenResult {
+        let writes = oflag & (O_WRONLY | O_RDWR | O_APPEND | O_CREAT | O_TRUNC) != 0;
+        if writes {
+            self.ensure_top_parent_dirs(path);
+            return self.top.open_with_handle(path, oflag, mode);
+        }
+
+        self.visible_layer(path).open_with_handle(path, oflag, mode)
+    }
+
     fn openat(&self, _dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
         self.open(path, flag, mode)
     }
@@ -191,5 +201,15 @@ mod test {
 
         assert_eq!(fs.top_layer().access(Path::new("/home"), F_OK), 0);
         assert_eq!(fs.top_layer().access(Path::new("/home/leite"), F_OK), 0);
+    }
+
+    #[test]
+    fn test_overlay_forwards_opened_file_handle() {
+        let fs = OverlayFS::new("overlay", MemoryFS::new("top"), MemoryFS::new("base"));
+
+        let result = fs.open_with_handle(Path::new("/file.txt"), O_CREAT | O_WRONLY, 0o644);
+
+        assert!(result.fd >= 0);
+        assert!(result.opened.is_some());
     }
 }

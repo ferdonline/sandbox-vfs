@@ -2,6 +2,7 @@
 use std::ffi::OsString;
 use std::fmt::Debug;
 use std::path::Path;
+use std::sync::Arc;
 
 use libc::{mode_t, stat};
 
@@ -24,6 +25,28 @@ pub struct VfsDirEntry {
     pub ino: Option<u64>,
 }
 
+/// Backend-owned identity and operations for one opened filesystem object.
+pub trait OpenedFile: Debug + Sync + Send + 'static {
+    fn stat(&self, statbuf: &mut stat) -> i32;
+
+    fn read_dir(&self) -> Option<Vec<VfsDirEntry>> {
+        None
+    }
+}
+
+/// A real file descriptor and, when needed, its backend-owned virtual identity.
+#[derive(Debug)]
+pub struct OpenResult {
+    pub fd: i32,
+    pub opened: Option<Arc<dyn OpenedFile>>,
+}
+
+impl OpenResult {
+    pub fn from_fd(fd: i32) -> Self {
+        Self { fd, opened: None }
+    }
+}
+
 /// File system implementations must implement this trait
 /// All path parameters are absolute, starting with '/'
 pub trait LowLevelFS: Debug + Sync + Send + 'static {
@@ -34,6 +57,11 @@ pub trait LowLevelFS: Debug + Sync + Send + 'static {
     fn mkdir(&self, path: &Path, mode: mode_t) -> i32;
     fn chmod(&self, path: &Path, mode: mode_t) -> i32;
     fn stat(&self, path: &Path, statbuf: &mut stat) -> i32;
+
+    /// Open a path and optionally retain backend-owned identity for fd operations.
+    fn open_with_handle(&self, path: &Path, flag: i32, mode: mode_t) -> OpenResult {
+        OpenResult::from_fd(self.open(path, flag, mode))
+    }
 
     /// Return the direct children of `path` when the backend can enumerate it virtually.
     ///

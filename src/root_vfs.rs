@@ -9,13 +9,14 @@ use std::{
 
 use libc::{c_void, mode_t, stat, AT_FDCWD};
 
-use crate::filesystem::{LowLevelFS, VfsDirEntry};
+use crate::filesystem::{LowLevelFS, OpenResult, OpenedFile, VfsDirEntry};
 use crate::linux_dirents;
 
 #[derive(Debug, Clone)]
 struct FdInfo {
     path: PathBuf,
     dir_offset: usize,
+    opened: Option<std::sync::Arc<dyn OpenedFile>>,
 }
 
 #[derive(Debug)]
@@ -117,17 +118,18 @@ impl RootVFS {
         (self.root.as_ref(), in_path)
     }
 
-    fn track_fd(&self, fd: i32, path: PathBuf) -> i32 {
-        if fd >= 0 {
+    fn track_open(&self, result: OpenResult, path: PathBuf) -> i32 {
+        if result.fd >= 0 {
             self.fds.write().unwrap().insert(
-                fd,
+                result.fd,
                 FdInfo {
                     path,
                     dir_offset: 0,
+                    opened: result.opened,
                 },
             );
         }
-        fd
+        result.fd
     }
 
     pub fn forget_fd(&self, fd: i32) {
@@ -148,12 +150,12 @@ impl RootVFS {
     }
 
     pub fn fstat(&self, fd: i32, statbuf: &mut stat) -> Option<i32> {
-        let virtual_path = {
+        let opened = {
             let fds = self.fds.read().unwrap();
-            fds.get(&fd)?.path.clone()
+            fds.get(&fd)?.opened.clone()
         };
 
-        Some(self.stat(&virtual_path, statbuf))
+        opened.map(|opened| opened.stat(statbuf))
     }
 
     pub fn read_dir(&self, path: &Path) -> Option<Vec<VfsDirEntry>> {
@@ -172,15 +174,20 @@ impl RootVFS {
     /// `dirp` must point to a writable buffer of at least `count` bytes, using
     /// the same contract as Linux `getdents64`.
     pub unsafe fn getdents64(&self, fd: i32, dirp: *mut c_void, count: i32) -> Option<isize> {
-        let (virtual_path, dir_offset) = {
+        let (virtual_path, dir_offset, opened) = {
             let fds = self.fds.read().unwrap();
             let info = fds.get(&fd)?;
-            (info.path.clone(), info.dir_offset)
+            (info.path.clone(), info.dir_offset, info.opened.clone())
         };
 
-        let (fs, backend_path) = self.absolute_path_to_fs(virtual_path.clone());
         let mut entries = Vec::from(linux_dirents::dot_entries());
-        entries.extend(fs.read_dir(&backend_path)?);
+        match opened.and_then(|opened| opened.read_dir()) {
+            Some(opened_entries) => entries.extend(opened_entries),
+            None => {
+                let (fs, backend_path) = self.absolute_path_to_fs(virtual_path.clone());
+                entries.extend(fs.read_dir(&backend_path)?);
+            }
+        }
 
         let result = unsafe {
             linux_dirents::write_dirents64(
@@ -215,7 +222,10 @@ impl LowLevelFS for RootVFS {
     fn open(&self, path: &Path, oflag: i32, mode: mode_t) -> i32 {
         let virtual_path = self.resolve_path(path);
         let (fs, backend_path) = self.absolute_path_to_fs(virtual_path.clone());
-        self.track_fd(fs.open(&backend_path, oflag, mode), virtual_path)
+        self.track_open(
+            fs.open_with_handle(&backend_path, oflag, mode),
+            virtual_path,
+        )
     }
 
     fn mkdir(&self, path: &Path, mode: mode_t) -> i32 {
@@ -239,7 +249,7 @@ impl LowLevelFS for RootVFS {
         };
 
         let (fs, backend_path) = self.absolute_path_to_fs(virtual_path.clone());
-        self.track_fd(fs.open(&backend_path, flag, mode), virtual_path)
+        self.track_open(fs.open_with_handle(&backend_path, flag, mode), virtual_path)
     }
 }
 
@@ -375,6 +385,20 @@ mod test {
     }
 
     #[test]
+    fn test_fstat_uses_opened_node_when_tracked_path_is_stale() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        let fd = root.open(Path::new("/file.txt"), O_CREAT, 0o644);
+        let mut expected = unsafe { std::mem::zeroed() };
+        assert_eq!(root.stat(Path::new("/file.txt"), &mut expected), 0);
+
+        root.fds.write().unwrap().get_mut(&fd).unwrap().path = PathBuf::from("/missing");
+
+        let mut actual = unsafe { std::mem::zeroed() };
+        assert_eq!(root.fstat(fd, &mut actual), Some(0));
+        assert_eq!(actual.st_ino, expected.st_ino);
+    }
+
+    #[test]
     fn test_getdents64_reads_memory_directory_entries() {
         let root = RootVFS::new(MemoryFS::new("root"));
         root.mkdir(Path::new("/work"), 0o755);
@@ -382,6 +406,7 @@ mod test {
         assert!(root.open(Path::new("/work/file.txt"), O_CREAT, 0o644) > 0);
 
         let dirfd = root.open(Path::new("/work"), O_RDONLY, 0);
+        root.fds.write().unwrap().get_mut(&dirfd).unwrap().path = PathBuf::from("/missing");
         let mut buf = vec![0_u8; 1024];
 
         let written = unsafe {
