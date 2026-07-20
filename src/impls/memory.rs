@@ -71,6 +71,17 @@ impl OpenedFile for MemoryOpenedFile {
         })
     }
 
+    fn mkdir_child(&self, path: &Path, mode: mode_t) -> Option<i32> {
+        if !can_resolve_relative_to_opened_node(path) {
+            return None;
+        }
+
+        Some(
+            create_relative_node(&self.node, &self.nodes, path, VfsEntryKind::Dir, mode)
+                .map_or(-1, |_| 0),
+        )
+    }
+
     fn read_dir(&self) -> Option<Vec<VfsDirEntry>> {
         read_node_dir(&self.node, &self.nodes)
     }
@@ -261,7 +272,7 @@ fn create_node_in_dir(
 }
 
 fn resolve_relative(start: &Arc<Node>, nodes: &NodeMap, path: &Path) -> Option<Arc<Node>> {
-    if path.is_absolute() {
+    if !can_resolve_relative_to_opened_node(path) {
         return None;
     }
 
@@ -283,20 +294,21 @@ fn resolve_relative(start: &Arc<Node>, nodes: &NodeMap, path: &Path) -> Option<A
     Some(node)
 }
 
-fn create_relative_file(
+fn create_relative_node(
     start: &Arc<Node>,
     nodes: &NodeMap,
     path: &Path,
+    kind: VfsEntryKind,
     mode: mode_t,
 ) -> Option<Arc<Node>> {
-    if path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+    if !can_resolve_relative_to_opened_node(path) {
         return None;
     }
 
     let parent_path = path.parent()?;
     let name = path.file_name()?;
     let parent = resolve_relative(start, nodes, parent_path)?;
-    create_node_in_dir(&parent, nodes, name, VfsEntryKind::File, mode)
+    create_node_in_dir(&parent, nodes, name, kind, mode)
 }
 
 fn open_resolved_node(
@@ -338,16 +350,20 @@ fn open_node_relative(
     flags: i32,
     mode: mode_t,
 ) -> Option<(RawFd, Option<Arc<Node>>)> {
-    if path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+    if !can_resolve_relative_to_opened_node(path) {
         return None;
     }
 
     let existing = resolve_relative(start, nodes, path);
     Some(open_resolved_node(
         existing,
-        || create_relative_file(start, nodes, path, mode),
+        || create_relative_node(start, nodes, path, VfsEntryKind::File, mode),
         flags,
     ))
+}
+
+fn can_resolve_relative_to_opened_node(path: &Path) -> bool {
+    !path.is_absolute() && !path.components().any(|c| c == Component::ParentDir)
 }
 
 fn stat_node(node: &Node, nodes: &NodeMap, statbuf: &mut stat) -> i32 {

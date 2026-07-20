@@ -137,8 +137,8 @@ matching normal Unix filesystem behavior.
 Backends that rely entirely on real kernel descriptors do not need to provide a
 virtual opened-file handle.
 
-For `MemoryFS`, simple relative `openat()` paths are also resolved through the
-opened directory handle. This keeps an opened directory useful even if its
-tracked virtual path becomes stale. Paths containing `..` still fall back to
-the path-based resolver because parent lookup is namespace-dependent until
-directory nodes grow parent-entry tracking.
+For `MemoryFS`, simple relative `openat()` and `mkdirat()` paths are also
+resolved through the opened directory handle. This keeps an opened directory
+useful even if its tracked virtual path becomes stale. Paths containing `..`
+still fall back to the path-based resolver because parent lookup is
+namespace-dependent until directory nodes grow parent-entry tracking.

@@ -35,6 +35,12 @@ pub trait OpenedFile: Debug + Sync + Send + 'static {
         None
     }
 
+    /// Create a directory relative to this opened object, when the backend can
+    /// do so without going back through a virtual path lookup.
+    fn mkdir_child(&self, _path: &Path, _mode: mode_t) -> Option<i32> {
+        None
+    }
+
     fn read_dir(&self) -> Option<Vec<VfsDirEntry>> {
         None
     }

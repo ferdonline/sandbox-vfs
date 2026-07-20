@@ -165,7 +165,24 @@ impl RootVFS {
             .map(|result| self.track_open(result, virtual_path))
     }
 
+    fn mkdirat_from_tracked_handle(&self, dirfd: i32, path: &Path, mode: mode_t) -> Option<i32> {
+        if path.is_absolute() || dirfd == AT_FDCWD {
+            return None;
+        }
+
+        let opened = {
+            let fds = self.fds.read().unwrap();
+            fds.get(&dirfd)?.opened.clone()?
+        };
+
+        opened.mkdir_child(path, mode)
+    }
+
     pub fn mkdirat(&self, dirfd: i32, path: &Path, mode: mode_t) -> i32 {
+        if let Some(result) = self.mkdirat_from_tracked_handle(dirfd, path, mode) {
+            return result;
+        }
+
         let Some(virtual_path) = self.resolve_openat_path(dirfd, path) else {
             return -1;
         };
@@ -402,6 +419,18 @@ mod test {
 
         assert!(root.openat(dirfd, Path::new("out.txt"), O_CREAT, 0o644) > 0);
         assert_eq!(root.access(Path::new("/work/out.txt"), F_OK), 0);
+    }
+
+    #[test]
+    fn test_mkdirat_uses_opened_directory_handle_when_tracked_path_is_stale() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+
+        let dirfd = root.open(Path::new("/work"), O_RDONLY, 0);
+        root.fds.write().unwrap().get_mut(&dirfd).unwrap().path = PathBuf::from("/missing");
+
+        assert_eq!(root.mkdirat(dirfd, Path::new("out"), 0o755), 0);
+        assert_eq!(root.access(Path::new("/work/out"), F_OK), 0);
     }
 
     #[test]
