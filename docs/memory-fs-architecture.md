@@ -36,6 +36,7 @@ MemoryFS
 
 Directory node
   entries: filename -> NodeId
+  parent: NodeId
 ```
 
 Paths are not stored as node identity. Resolving `/work/report.txt` walks the
@@ -49,8 +50,8 @@ Node IDs are process-global and stable for the lifetime of their node. This
 allows `stat()` and directory entries returned by `getdents64()` to report the
 same inode number.
 
-This representation also provides the foundation for rename, unlink, and hard
-links: those operations change directory entries without replacing the node.
+This representation lets rename and unlink change directory entries without
+replacing the node. It also provides the foundation for hard links.
 
 ## Kernel-Backed Regular Files
 
@@ -123,19 +124,22 @@ fd -> {
 }
 ```
 
-The virtual path remains useful for resolving relative `openat()` calls.
-Operations that act on the already-opened object, such as `fstat()` and
-`getdents64()`, use the backend-owned handle instead.
+The virtual path remains useful for resolving relative `openat()` calls for
+backends that do not expose virtual handles. Operations that act on the
+already-opened object, such as `fstat()` and `getdents64()`, use the
+backend-owned handle instead.
 
 For `MemoryFS`, the handle retains an `Arc` to the opened node. It therefore
 continues to identify the same node even if its original path becomes stale.
-When unlink support is added, this will allow an unlinked node to remain usable
-through existing open descriptors until the final reference is closed,
-matching normal Unix filesystem behavior.
+After `unlink()` removes a file from the namespace, existing open descriptors
+continue to keep the node usable until the final reference is closed, matching
+normal Unix filesystem behavior.
 
 Backends that rely entirely on real kernel descriptors do not need to provide a
 virtual opened-file handle.
 
-Relative `openat()` resolution is still path-based. A future stage should allow
-capable backend handles to resolve children directly so an opened directory
-continues to work as an `openat()` base after that directory is renamed.
+For `MemoryFS`, relative `openat()` and `mkdirat()` paths are also resolved
+through the opened directory handle. Directory nodes track their parent node, so
+`..` continues to work after a parent directory is renamed. The tracked virtual
+path remains a best-effort path for debugging and for backends without opened
+handles.

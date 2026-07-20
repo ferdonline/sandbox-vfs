@@ -24,6 +24,14 @@ const LOWER_ENV: &str = "SANDBOX_VFS_LOWER";
 const UPPER_ENV: &str = "SANDBOX_VFS_UPPER";
 const BACKEND_ENV: &str = "SANDBOX_VFS_BACKEND";
 const MEMORY_MOUNT_ENV: &str = "SANDBOX_VFS_MEMORY_MOUNT";
+const F_GETSIG_CMD: c_int = 11;
+const F_SETOWN_EX_CMD: c_int = 15;
+const F_GETOWN_EX_CMD: c_int = 16;
+const F_GETOWNER_UIDS_CMD: c_int = 17;
+const F_GET_RW_HINT_CMD: c_int = 1035;
+const F_SET_RW_HINT_CMD: c_int = 1036;
+const F_GET_FILE_RW_HINT_CMD: c_int = 1037;
+const F_SET_FILE_RW_HINT_CMD: c_int = 1038;
 
 #[derive(Debug)]
 struct MaterializedDir {
@@ -162,6 +170,33 @@ dlhooks::hook! {
     }
 }
 dlhooks::hook! {
+    unsafe fn dup(fd: c_int) -> c_int => {
+        let result = Self::call_orig(fd);
+        if result >= 0 {
+            VFS.clone_fd(fd, result);
+        }
+        result
+    }
+}
+dlhooks::hook! {
+    unsafe fn dup2(oldfd: c_int, newfd: c_int) -> c_int => {
+        let result = Self::call_orig(oldfd, newfd);
+        if result >= 0 {
+            VFS.clone_fd(oldfd, result);
+        }
+        result
+    }
+}
+dlhooks::hook! {
+    unsafe fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int => {
+        let result = Self::call_orig(oldfd, newfd, flags);
+        if result >= 0 {
+            VFS.clone_fd(oldfd, result);
+        }
+        result
+    }
+}
+dlhooks::hook! {
     unsafe fn mkdir(path: *const c_char, mode: mode_t) -> c_int => {
         VFS.mkdir(Path::from_cstr(path), mode)
     }
@@ -169,6 +204,56 @@ dlhooks::hook! {
 dlhooks::hook! {
     unsafe fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: mode_t) -> c_int => {
         VFS.mkdirat(dirfd, Path::from_cstr(pathname), mode)
+    }
+}
+dlhooks::hook! {
+    unsafe fn unlink(path: *const c_char) -> c_int => {
+        VFS.unlink(Path::from_cstr(path))
+    }
+}
+dlhooks::hook! {
+    unsafe fn rmdir(path: *const c_char) -> c_int => {
+        VFS.rmdir(Path::from_cstr(path))
+    }
+}
+dlhooks::hook! {
+    unsafe fn unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int => {
+        VFS.unlinkat(dirfd, Path::from_cstr(pathname), flags)
+    }
+}
+dlhooks::hook! {
+    unsafe fn rename(oldpath: *const c_char, newpath: *const c_char) -> c_int => {
+        VFS.rename(Path::from_cstr(oldpath), Path::from_cstr(newpath))
+    }
+}
+dlhooks::hook! {
+    unsafe fn renameat(olddirfd: c_int, oldpath: *const c_char, newdirfd: c_int, newpath: *const c_char) -> c_int => {
+        VFS.renameat(
+            olddirfd,
+            Path::from_cstr(oldpath),
+            newdirfd,
+            Path::from_cstr(newpath),
+        )
+    }
+}
+dlhooks::hook! {
+    unsafe fn renameat2(
+        olddirfd: c_int,
+        oldpath: *const c_char,
+        newdirfd: c_int,
+        newpath: *const c_char,
+        flags: libc::c_uint
+    ) -> c_int => {
+        if flags == 0 {
+            VFS.renameat(
+                olddirfd,
+                Path::from_cstr(oldpath),
+                newdirfd,
+                Path::from_cstr(newpath),
+            )
+        } else {
+            Self::call_orig(olddirfd, oldpath, newdirfd, newpath, flags)
+        }
     }
 }
 dlhooks::hook! {
@@ -337,6 +422,68 @@ pub unsafe extern "C" fn open64(cpath: *const c_char, oflag: c_int, mut va_args:
         _ => unsafe { va_args.arg::<libc::c_uint>() as mode_t },
     };
     VFS.open(Path::from_cstr(cpath), oflag, mode)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn fcntl(fd: c_int, cmd: c_int, mut va_args: ...) -> c_int {
+    match cmd {
+        libc::F_DUPFD | libc::F_DUPFD_CLOEXEC => {
+            let minfd = unsafe { va_args.arg::<c_int>() };
+            let result = Fcntl::call_orig_int(fd, cmd, minfd);
+            if result >= 0 {
+                VFS.clone_fd(fd, result);
+            }
+            result
+        }
+        libc::F_GETFD
+        | libc::F_GETFL
+        | libc::F_GETOWN
+        | F_GETSIG_CMD
+        | libc::F_GETLEASE
+        | libc::F_GETPIPE_SZ
+        | libc::F_GET_SEALS => Fcntl::call_orig_no_arg(fd, cmd),
+        libc::F_GETLK
+        | libc::F_SETLK
+        | libc::F_SETLKW
+        | libc::F_OFD_GETLK
+        | libc::F_OFD_SETLK
+        | libc::F_OFD_SETLKW
+        | F_GETOWN_EX_CMD
+        | F_SETOWN_EX_CMD
+        | F_GETOWNER_UIDS_CMD
+        | F_GET_RW_HINT_CMD
+        | F_SET_RW_HINT_CMD
+        | F_GET_FILE_RW_HINT_CMD
+        | F_SET_FILE_RW_HINT_CMD => {
+            let arg = unsafe { va_args.arg::<*mut c_void>() };
+            Fcntl::call_orig_ptr(fd, cmd, arg)
+        }
+        _ => {
+            let arg = unsafe { va_args.arg::<c_int>() };
+            Fcntl::call_orig_int(fd, cmd, arg)
+        }
+    }
+}
+
+pub struct Fcntl;
+impl Fcntl {
+    fn orig() -> unsafe extern "C" fn(c_int, c_int, ...) -> c_int {
+        static REAL: OnceLock<usize> = OnceLock::new();
+        let real = *REAL.get_or_init(|| crate::dlhooks::dlsym_next("fcntl\0") as usize);
+        unsafe { ::std::mem::transmute(real) }
+    }
+
+    fn call_orig_no_arg(fd: c_int, cmd: c_int) -> c_int {
+        unsafe { Self::orig()(fd, cmd) }
+    }
+
+    fn call_orig_int(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
+        unsafe { Self::orig()(fd, cmd, arg) }
+    }
+
+    fn call_orig_ptr(fd: c_int, cmd: c_int, arg: *mut c_void) -> c_int {
+        unsafe { Self::orig()(fd, cmd, arg) }
+    }
 }
 
 // dlhooks::hook! {

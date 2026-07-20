@@ -29,6 +29,18 @@ pub struct VfsDirEntry {
 pub trait OpenedFile: Debug + Sync + Send + 'static {
     fn stat(&self, statbuf: &mut stat) -> i32;
 
+    /// Open a path relative to this opened object, when the backend can do so
+    /// without going back through a virtual path lookup.
+    fn open_child(&self, _path: &Path, _flag: i32, _mode: mode_t) -> Option<OpenResult> {
+        None
+    }
+
+    /// Create a directory relative to this opened object, when the backend can
+    /// do so without going back through a virtual path lookup.
+    fn mkdir_child(&self, _path: &Path, _mode: mode_t) -> Option<i32> {
+        None
+    }
+
     fn read_dir(&self) -> Option<Vec<VfsDirEntry>> {
         None
     }
@@ -55,6 +67,9 @@ pub trait LowLevelFS: Debug + Sync + Send + 'static {
     fn open(&self, path: &Path, flag: i32, mode: mode_t) -> i32;
     fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32;
     fn mkdir(&self, path: &Path, mode: mode_t) -> i32;
+    fn unlink(&self, path: &Path) -> i32;
+    fn rmdir(&self, path: &Path) -> i32;
+    fn rename(&self, old_path: &Path, new_path: &Path) -> i32;
     fn chmod(&self, path: &Path, mode: mode_t) -> i32;
     fn stat(&self, path: &Path, statbuf: &mut stat) -> i32;
 

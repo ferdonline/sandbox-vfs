@@ -136,17 +136,107 @@ impl RootVFS {
         self.fds.write().unwrap().remove(&fd);
     }
 
+    pub fn clone_fd(&self, oldfd: i32, newfd: i32) {
+        let mut fds = self.fds.write().unwrap();
+        match fds.get(&oldfd).cloned() {
+            Some(info) => {
+                fds.insert(newfd, info);
+            }
+            None => {
+                fds.remove(&newfd);
+            }
+        }
+    }
+
     pub fn resolve_at(&self, dirfd: i32, path: &Path) -> Option<PathBuf> {
         self.resolve_openat_path(dirfd, path)
     }
 
+    fn openat_from_tracked_handle(
+        &self,
+        dirfd: i32,
+        path: &Path,
+        flag: i32,
+        mode: mode_t,
+    ) -> Option<i32> {
+        if path.is_absolute() || dirfd == AT_FDCWD {
+            return None;
+        }
+
+        let (virtual_path, opened) = {
+            let fds = self.fds.read().unwrap();
+            let info = fds.get(&dirfd)?;
+            (
+                Self::normalize_absolute(&info.path.join(path)),
+                info.opened.clone()?,
+            )
+        };
+
+        opened
+            .open_child(path, flag, mode)
+            .map(|result| self.track_open(result, virtual_path))
+    }
+
+    fn mkdirat_from_tracked_handle(&self, dirfd: i32, path: &Path, mode: mode_t) -> Option<i32> {
+        if path.is_absolute() || dirfd == AT_FDCWD {
+            return None;
+        }
+
+        let opened = {
+            let fds = self.fds.read().unwrap();
+            fds.get(&dirfd)?.opened.clone()?
+        };
+
+        opened.mkdir_child(path, mode)
+    }
+
     pub fn mkdirat(&self, dirfd: i32, path: &Path, mode: mode_t) -> i32 {
+        if let Some(result) = self.mkdirat_from_tracked_handle(dirfd, path, mode) {
+            return result;
+        }
+
         let Some(virtual_path) = self.resolve_openat_path(dirfd, path) else {
             return -1;
         };
 
         let (fs, backend_path) = self.absolute_path_to_fs(virtual_path);
         fs.mkdir(&backend_path, mode)
+    }
+
+    pub fn unlinkat(&self, dirfd: i32, path: &Path, flags: i32) -> i32 {
+        let Some(virtual_path) = self.resolve_openat_path(dirfd, path) else {
+            return -1;
+        };
+
+        let (fs, backend_path) = self.absolute_path_to_fs(virtual_path);
+        if flags & libc::AT_REMOVEDIR != 0 {
+            fs.rmdir(&backend_path)
+        } else {
+            fs.unlink(&backend_path)
+        }
+    }
+
+    pub fn renameat(
+        &self,
+        old_dirfd: i32,
+        old_path: &Path,
+        new_dirfd: i32,
+        new_path: &Path,
+    ) -> i32 {
+        let Some(old_virtual_path) = self.resolve_openat_path(old_dirfd, old_path) else {
+            return -1;
+        };
+        let Some(new_virtual_path) = self.resolve_openat_path(new_dirfd, new_path) else {
+            return -1;
+        };
+
+        let (old_fs, old_backend_path) = self.absolute_path_to_fs(old_virtual_path);
+        let (new_fs, new_backend_path) = self.absolute_path_to_fs(new_virtual_path);
+        if !std::ptr::eq(old_fs, new_fs) {
+            return -1;
+        }
+
+        old_fs.rename(&old_backend_path, &new_backend_path)
     }
 
     pub fn fstat(&self, fd: i32, statbuf: &mut stat) -> Option<i32> {
@@ -233,6 +323,20 @@ impl LowLevelFS for RootVFS {
         fs.mkdir(&path, mode)
     }
 
+    fn unlink(&self, path: &Path) -> i32 {
+        let (fs, path) = self.path_to_fs(path);
+        fs.unlink(&path)
+    }
+
+    fn rmdir(&self, path: &Path) -> i32 {
+        let (fs, path) = self.path_to_fs(path);
+        fs.rmdir(&path)
+    }
+
+    fn rename(&self, old_path: &Path, new_path: &Path) -> i32 {
+        self.renameat(AT_FDCWD, old_path, AT_FDCWD, new_path)
+    }
+
     fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
         let (fs, path) = self.path_to_fs(path);
         fs.chmod(&path, mode)
@@ -244,6 +348,10 @@ impl LowLevelFS for RootVFS {
     }
 
     fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
+        if let Some(fd) = self.openat_from_tracked_handle(dirfd, path, flag, mode) {
+            return fd;
+        }
+
         let Some(virtual_path) = self.resolve_openat_path(dirfd, path) else {
             return -1;
         };
@@ -352,6 +460,34 @@ mod test {
     }
 
     #[test]
+    fn test_openat_dotdot_uses_opened_directory_parent_after_rename() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+        root.mkdir(Path::new("/work/build"), 0o755);
+
+        let dirfd = root.open(Path::new("/work/build"), O_RDONLY, 0);
+        assert_eq!(root.rename(Path::new("/work"), Path::new("/renamed")), 0);
+
+        assert!(root.openat(dirfd, Path::new("../out.txt"), O_CREAT, 0o644) > 0);
+        assert_eq!(root.access(Path::new("/renamed/out.txt"), F_OK), 0);
+        assert_ne!(root.access(Path::new("/work/out.txt"), F_OK), 0);
+    }
+
+    #[test]
+    fn test_mkdirat_dotdot_uses_opened_directory_parent_after_rename() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+        root.mkdir(Path::new("/work/build"), 0o755);
+
+        let dirfd = root.open(Path::new("/work/build"), O_RDONLY, 0);
+        assert_eq!(root.rename(Path::new("/work"), Path::new("/renamed")), 0);
+
+        assert_eq!(root.mkdirat(dirfd, Path::new("../out"), 0o755), 0);
+        assert_eq!(root.access(Path::new("/renamed/out"), F_OK), 0);
+        assert_ne!(root.access(Path::new("/work/out"), F_OK), 0);
+    }
+
+    #[test]
     fn test_openat_tracked_fd_keeps_virtual_mount_path() {
         let root = RootVFS::new(MemoryFS::new("root")).with_mount("/mnt", MemoryFS::new("mnt"));
         root.mkdir(Path::new("/mnt/work"), 0o755);
@@ -361,6 +497,30 @@ mod test {
         assert!(dirfd > 0);
         assert!(root.openat(dirfd, Path::new("out.txt"), O_CREAT, 0o644) > 0);
         assert_eq!(root.access(Path::new("/mnt/work/out.txt"), F_OK), 0);
+    }
+
+    #[test]
+    fn test_openat_uses_opened_directory_handle_when_tracked_path_is_stale() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+
+        let dirfd = root.open(Path::new("/work"), O_RDONLY, 0);
+        root.fds.write().unwrap().get_mut(&dirfd).unwrap().path = PathBuf::from("/missing");
+
+        assert!(root.openat(dirfd, Path::new("out.txt"), O_CREAT, 0o644) > 0);
+        assert_eq!(root.access(Path::new("/work/out.txt"), F_OK), 0);
+    }
+
+    #[test]
+    fn test_mkdirat_uses_opened_directory_handle_when_tracked_path_is_stale() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+
+        let dirfd = root.open(Path::new("/work"), O_RDONLY, 0);
+        root.fds.write().unwrap().get_mut(&dirfd).unwrap().path = PathBuf::from("/missing");
+
+        assert_eq!(root.mkdirat(dirfd, Path::new("out"), 0o755), 0);
+        assert_eq!(root.access(Path::new("/work/out"), F_OK), 0);
     }
 
     #[test]
@@ -385,6 +545,33 @@ mod test {
     }
 
     #[test]
+    fn test_clone_fd_preserves_openat_base() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+
+        let dirfd = root.open(Path::new("/work"), O_RDONLY, 0);
+        let cloned = 1234;
+        root.clone_fd(dirfd, cloned);
+        root.forget_fd(dirfd);
+
+        assert!(root.openat(cloned, Path::new("out.txt"), O_CREAT, 0o644) > 0);
+        assert_eq!(root.access(Path::new("/work/out.txt"), F_OK), 0);
+    }
+
+    #[test]
+    fn test_clone_fd_from_untracked_fd_clears_reused_target() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+
+        let dirfd = root.open(Path::new("/work"), O_RDONLY, 0);
+        let reused = 1234;
+        root.clone_fd(dirfd, reused);
+        root.clone_fd(5678, reused);
+
+        assert_ne!(root.openat(reused, Path::new("out.txt"), O_CREAT, 0o644), 0);
+    }
+
+    #[test]
     fn test_fstat_uses_opened_node_when_tracked_path_is_stale() {
         let root = RootVFS::new(MemoryFS::new("root"));
         let fd = root.open(Path::new("/file.txt"), O_CREAT, 0o644);
@@ -396,6 +583,58 @@ mod test {
         let mut actual = unsafe { std::mem::zeroed() };
         assert_eq!(root.fstat(fd, &mut actual), Some(0));
         assert_eq!(actual.st_ino, expected.st_ino);
+    }
+
+    #[test]
+    fn test_fstat_keeps_open_unlinked_memory_file_alive() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        let fd = root.open(Path::new("/file.txt"), O_CREAT, 0o644);
+        let mut before = unsafe { std::mem::zeroed() };
+        assert_eq!(root.fstat(fd, &mut before), Some(0));
+
+        assert_eq!(root.unlink(Path::new("/file.txt")), 0);
+        assert_ne!(root.access(Path::new("/file.txt"), F_OK), 0);
+
+        let mut after = unsafe { std::mem::zeroed() };
+        assert_eq!(root.fstat(fd, &mut after), Some(0));
+        assert_eq!(after.st_ino, before.st_ino);
+        assert_eq!(after.st_nlink, 0);
+    }
+
+    #[test]
+    fn test_fstat_keeps_open_renamed_memory_file_identity() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        let fd = root.open(Path::new("/old.txt"), O_CREAT, 0o644);
+        let mut before = unsafe { std::mem::zeroed() };
+        assert_eq!(root.fstat(fd, &mut before), Some(0));
+
+        assert_eq!(root.rename(Path::new("/old.txt"), Path::new("/new.txt")), 0);
+        assert_ne!(root.access(Path::new("/old.txt"), F_OK), 0);
+        assert_eq!(root.access(Path::new("/new.txt"), F_OK), 0);
+
+        let mut after = unsafe { std::mem::zeroed() };
+        assert_eq!(root.fstat(fd, &mut after), Some(0));
+        assert_eq!(after.st_ino, before.st_ino);
+        assert_eq!(after.st_nlink, 1);
+    }
+
+    #[test]
+    fn test_renameat_resolves_relative_paths() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+        assert!(root.open(Path::new("/work/old.txt"), O_CREAT, 0o644) > 0);
+        root.set_cwd("/work");
+
+        assert_eq!(
+            root.renameat(
+                libc::AT_FDCWD,
+                Path::new("old.txt"),
+                libc::AT_FDCWD,
+                Path::new("new.txt"),
+            ),
+            0
+        );
+        assert_eq!(root.access(Path::new("/work/new.txt"), F_OK), 0);
     }
 
     #[test]
