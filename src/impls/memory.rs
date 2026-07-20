@@ -32,6 +32,7 @@ pub struct MemoryFS {
 #[derive(Debug)]
 struct Node {
     id: NodeId,
+    parent: RwLock<Option<NodeId>>,
     mode: RwLock<mode_t>,
     links: RwLock<u64>,
     kind: NodeKind,
@@ -154,6 +155,7 @@ impl MemoryFS {
         let root_id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
         let root = Arc::new(Node {
             id: root_id,
+            parent: RwLock::new(Some(root_id)),
             mode: RwLock::new(0o755),
             links: RwLock::new(1),
             kind: NodeKind::Directory {
@@ -294,6 +296,7 @@ fn create_node_in_dir(
 
     let node = Arc::new(Node {
         id,
+        parent: RwLock::new(Some(parent.id)),
         mode: RwLock::new(mode & 0o7777),
         links: RwLock::new(1),
         kind: node_kind,
@@ -333,6 +336,7 @@ fn remove_node_at(path: &Path, nodes: &NodeMap, root: NodeId, kind: VfsEntryKind
     }
 
     entries.remove(name);
+    *node.parent.write().unwrap() = None;
     *node.links.write().unwrap() = 0;
     nodes.write().unwrap().remove(&id);
     0
@@ -391,6 +395,7 @@ fn rename_node_at(old_path: &Path, new_path: &Path, nodes: &NodeMap, root: NodeI
             if !can_replace_node(&node, &replaced) {
                 return -1;
             }
+            *replaced.parent.write().unwrap() = None;
             *replaced.links.write().unwrap() = 0;
             nodes.write().unwrap().remove(&replaced_id);
         }
@@ -433,10 +438,12 @@ fn rename_node_at(old_path: &Path, new_path: &Path, nodes: &NodeMap, root: NodeI
     let mut entries = new_entries.write().unwrap();
     if let Some(replaced_id) = entries.insert(new_name.to_os_string(), old_id) {
         if let Some(replaced) = node_from_map(nodes, replaced_id) {
+            *replaced.parent.write().unwrap() = None;
             *replaced.links.write().unwrap() = 0;
         }
         nodes.write().unwrap().remove(&replaced_id);
     }
+    *node.parent.write().unwrap() = Some(new_parent.id);
     0
 }
 
@@ -466,7 +473,10 @@ fn resolve_relative(start: &Arc<Node>, nodes: &NodeMap, path: &Path) -> Option<A
                 let child_id = *entries.read().unwrap().get(name)?;
                 node = node_from_map(nodes, child_id)?;
             }
-            Component::ParentDir => return None,
+            Component::ParentDir => {
+                let parent_id = node.parent.read().unwrap().as_ref().copied()?;
+                node = node_from_map(nodes, parent_id)?;
+            }
             Component::RootDir | Component::Prefix(_) => return None,
         }
     }
@@ -542,7 +552,7 @@ fn open_node_relative(
 }
 
 fn can_resolve_relative_to_opened_node(path: &Path) -> bool {
-    !path.is_absolute() && !path.components().any(|c| c == Component::ParentDir)
+    !path.is_absolute()
 }
 
 fn stat_node(node: &Node, nodes: &NodeMap, statbuf: &mut stat) -> i32 {

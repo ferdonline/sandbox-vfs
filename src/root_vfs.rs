@@ -460,6 +460,34 @@ mod test {
     }
 
     #[test]
+    fn test_openat_dotdot_uses_opened_directory_parent_after_rename() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+        root.mkdir(Path::new("/work/build"), 0o755);
+
+        let dirfd = root.open(Path::new("/work/build"), O_RDONLY, 0);
+        assert_eq!(root.rename(Path::new("/work"), Path::new("/renamed")), 0);
+
+        assert!(root.openat(dirfd, Path::new("../out.txt"), O_CREAT, 0o644) > 0);
+        assert_eq!(root.access(Path::new("/renamed/out.txt"), F_OK), 0);
+        assert_ne!(root.access(Path::new("/work/out.txt"), F_OK), 0);
+    }
+
+    #[test]
+    fn test_mkdirat_dotdot_uses_opened_directory_parent_after_rename() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+        root.mkdir(Path::new("/work/build"), 0o755);
+
+        let dirfd = root.open(Path::new("/work/build"), O_RDONLY, 0);
+        assert_eq!(root.rename(Path::new("/work"), Path::new("/renamed")), 0);
+
+        assert_eq!(root.mkdirat(dirfd, Path::new("../out"), 0o755), 0);
+        assert_eq!(root.access(Path::new("/renamed/out"), F_OK), 0);
+        assert_ne!(root.access(Path::new("/work/out"), F_OK), 0);
+    }
+
+    #[test]
     fn test_openat_tracked_fd_keeps_virtual_mount_path() {
         let root = RootVFS::new(MemoryFS::new("root")).with_mount("/mnt", MemoryFS::new("mnt"));
         root.mkdir(Path::new("/mnt/work"), 0o755);

@@ -36,6 +36,7 @@ MemoryFS
 
 Directory node
   entries: filename -> NodeId
+  parent: NodeId
 ```
 
 Paths are not stored as node identity. Resolving `/work/report.txt` walks the
@@ -137,8 +138,8 @@ normal Unix filesystem behavior.
 Backends that rely entirely on real kernel descriptors do not need to provide a
 virtual opened-file handle.
 
-For `MemoryFS`, simple relative `openat()` and `mkdirat()` paths are also
-resolved through the opened directory handle. This keeps an opened directory
-useful even if its tracked virtual path becomes stale. Paths containing `..`
-still fall back to the path-based resolver because parent lookup is
-namespace-dependent until directory nodes grow parent-entry tracking.
+For `MemoryFS`, relative `openat()` and `mkdirat()` paths are also resolved
+through the opened directory handle. Directory nodes track their parent node, so
+`..` continues to work after a parent directory is renamed. The tracked virtual
+path remains a best-effort path for debugging and for backends without opened
+handles.
