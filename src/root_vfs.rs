@@ -140,6 +140,31 @@ impl RootVFS {
         self.resolve_openat_path(dirfd, path)
     }
 
+    fn openat_from_tracked_handle(
+        &self,
+        dirfd: i32,
+        path: &Path,
+        flag: i32,
+        mode: mode_t,
+    ) -> Option<i32> {
+        if path.is_absolute() || dirfd == AT_FDCWD {
+            return None;
+        }
+
+        let (virtual_path, opened) = {
+            let fds = self.fds.read().unwrap();
+            let info = fds.get(&dirfd)?;
+            (
+                Self::normalize_absolute(&info.path.join(path)),
+                info.opened.clone()?,
+            )
+        };
+
+        opened
+            .open_child(path, flag, mode)
+            .map(|result| self.track_open(result, virtual_path))
+    }
+
     pub fn mkdirat(&self, dirfd: i32, path: &Path, mode: mode_t) -> i32 {
         let Some(virtual_path) = self.resolve_openat_path(dirfd, path) else {
             return -1;
@@ -244,6 +269,10 @@ impl LowLevelFS for RootVFS {
     }
 
     fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32 {
+        if let Some(fd) = self.openat_from_tracked_handle(dirfd, path, flag, mode) {
+            return fd;
+        }
+
         let Some(virtual_path) = self.resolve_openat_path(dirfd, path) else {
             return -1;
         };
@@ -361,6 +390,18 @@ mod test {
         assert!(dirfd > 0);
         assert!(root.openat(dirfd, Path::new("out.txt"), O_CREAT, 0o644) > 0);
         assert_eq!(root.access(Path::new("/mnt/work/out.txt"), F_OK), 0);
+    }
+
+    #[test]
+    fn test_openat_uses_opened_directory_handle_when_tracked_path_is_stale() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+
+        let dirfd = root.open(Path::new("/work"), O_RDONLY, 0);
+        root.fds.write().unwrap().get_mut(&dirfd).unwrap().path = PathBuf::from("/missing");
+
+        assert!(root.openat(dirfd, Path::new("out.txt"), O_CREAT, 0o644) > 0);
+        assert_eq!(root.access(Path::new("/work/out.txt"), F_OK), 0);
     }
 
     #[test]

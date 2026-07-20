@@ -123,9 +123,10 @@ fd -> {
 }
 ```
 
-The virtual path remains useful for resolving relative `openat()` calls.
-Operations that act on the already-opened object, such as `fstat()` and
-`getdents64()`, use the backend-owned handle instead.
+The virtual path remains useful for resolving relative `openat()` calls for
+backends that do not expose virtual handles. Operations that act on the
+already-opened object, such as `fstat()` and `getdents64()`, use the
+backend-owned handle instead.
 
 For `MemoryFS`, the handle retains an `Arc` to the opened node. It therefore
 continues to identify the same node even if its original path becomes stale.
@@ -136,6 +137,8 @@ matching normal Unix filesystem behavior.
 Backends that rely entirely on real kernel descriptors do not need to provide a
 virtual opened-file handle.
 
-Relative `openat()` resolution is still path-based. A future stage should allow
-capable backend handles to resolve children directly so an opened directory
-continues to work as an `openat()` base after that directory is renamed.
+For `MemoryFS`, simple relative `openat()` paths are also resolved through the
+opened directory handle. This keeps an opened directory useful even if its
+tracked virtual path becomes stale. Paths containing `..` still fall back to
+the path-based resolver because parent lookup is namespace-dependent until
+directory nodes grow parent-entry tracking.

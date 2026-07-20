@@ -29,6 +29,12 @@ pub struct VfsDirEntry {
 pub trait OpenedFile: Debug + Sync + Send + 'static {
     fn stat(&self, statbuf: &mut stat) -> i32;
 
+    /// Open a path relative to this opened object, when the backend can do so
+    /// without going back through a virtual path lookup.
+    fn open_child(&self, _path: &Path, _flag: i32, _mode: mode_t) -> Option<OpenResult> {
+        None
+    }
+
     fn read_dir(&self) -> Option<Vec<VfsDirEntry>> {
         None
     }

@@ -58,6 +58,19 @@ impl OpenedFile for MemoryOpenedFile {
         stat_node(&self.node, &self.nodes, statbuf)
     }
 
+    fn open_child(&self, path: &Path, flags: i32, mode: mode_t) -> Option<OpenResult> {
+        let (fd, node) = open_node_relative(&self.node, &self.nodes, path, flags, mode)?;
+        Some(OpenResult {
+            fd,
+            opened: node.map(|node| {
+                Arc::new(MemoryOpenedFile {
+                    node,
+                    nodes: self.nodes.clone(),
+                }) as Arc<dyn OpenedFile>
+            }),
+        })
+    }
+
     fn read_dir(&self) -> Option<Vec<VfsDirEntry>> {
         read_node_dir(&self.node, &self.nodes)
     }
@@ -180,68 +193,17 @@ impl MemoryFS {
 
     fn create_node(&self, path: &Path, kind: VfsEntryKind, mode: mode_t) -> Option<Arc<Node>> {
         let (parent, name) = self.resolve_parent(path)?;
-        let NodeKind::Directory { entries, .. } = &parent.kind else {
-            return None;
-        };
-
-        let mut entries = entries.write().unwrap();
-        if entries.contains_key(name) {
-            return None;
-        }
-
-        let id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
-        let node_kind = match kind {
-            VfsEntryKind::File => NodeKind::File {
-                backing_fd: create_memfd(b"sandbox-vfs-file\0"),
-            },
-            VfsEntryKind::Dir => NodeKind::Directory {
-                entries: RwLock::new(BTreeMap::new()),
-                placeholder_fd: create_memfd(b"sandbox-vfs-dir\0"),
-            },
-        };
-        if node_kind.backing_fd() < 0 {
-            return None;
-        }
-
-        let node = Arc::new(Node {
-            id,
-            mode: RwLock::new(mode & 0o7777),
-            kind: node_kind,
-        });
-        self.nodes.write().unwrap().insert(id, node.clone());
-        entries.insert(name.to_os_string(), id);
-        Some(node)
+        create_node_in_dir(&parent, &self.nodes, name, kind, mode)
     }
 
     fn open_node(&self, path: &Path, flags: i32, mode: mode_t) -> (RawFd, Option<Arc<Node>>) {
         Self::assert_absolute(path);
         let existing = self.resolve(path);
-        if existing.is_some()
-            && flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL
-        {
-            return (-1, None);
-        }
-
-        let node = match existing {
-            Some(node) => node,
-            None if flags & O_CREAT != 0 => {
-                let Some(node) = self.create_node(path, VfsEntryKind::File, mode) else {
-                    return (-1, None);
-                };
-                node
-            }
-            None => return (-1, None),
-        };
-
-        if flags & libc::O_DIRECTORY != 0 && !matches!(node.kind, NodeKind::Directory { .. }) {
-            return (-1, None);
-        }
-
-        let fd = open_backing(node.backing_fd(), flags);
-        if fd < 0 {
-            return (fd, None);
-        }
-        (fd, Some(node))
+        open_resolved_node(
+            existing,
+            || self.create_node(path, VfsEntryKind::File, mode),
+            flags,
+        )
     }
 }
 
@@ -256,6 +218,136 @@ impl NodeKind {
 
 fn node_from_map(nodes: &NodeMap, id: NodeId) -> Option<Arc<Node>> {
     nodes.read().unwrap().get(&id).cloned()
+}
+
+fn create_node_in_dir(
+    parent: &Node,
+    nodes: &NodeMap,
+    name: &OsStr,
+    kind: VfsEntryKind,
+    mode: mode_t,
+) -> Option<Arc<Node>> {
+    let NodeKind::Directory { entries, .. } = &parent.kind else {
+        return None;
+    };
+
+    let mut entries = entries.write().unwrap();
+    if entries.contains_key(name) {
+        return None;
+    }
+
+    let id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
+    let node_kind = match kind {
+        VfsEntryKind::File => NodeKind::File {
+            backing_fd: create_memfd(b"sandbox-vfs-file\0"),
+        },
+        VfsEntryKind::Dir => NodeKind::Directory {
+            entries: RwLock::new(BTreeMap::new()),
+            placeholder_fd: create_memfd(b"sandbox-vfs-dir\0"),
+        },
+    };
+    if node_kind.backing_fd() < 0 {
+        return None;
+    }
+
+    let node = Arc::new(Node {
+        id,
+        mode: RwLock::new(mode & 0o7777),
+        kind: node_kind,
+    });
+    nodes.write().unwrap().insert(id, node.clone());
+    entries.insert(name.to_os_string(), id);
+    Some(node)
+}
+
+fn resolve_relative(start: &Arc<Node>, nodes: &NodeMap, path: &Path) -> Option<Arc<Node>> {
+    if path.is_absolute() {
+        return None;
+    }
+
+    let mut node = start.clone();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                let NodeKind::Directory { entries, .. } = &node.kind else {
+                    return None;
+                };
+                let child_id = *entries.read().unwrap().get(name)?;
+                node = node_from_map(nodes, child_id)?;
+            }
+            Component::ParentDir => return None,
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(node)
+}
+
+fn create_relative_file(
+    start: &Arc<Node>,
+    nodes: &NodeMap,
+    path: &Path,
+    mode: mode_t,
+) -> Option<Arc<Node>> {
+    if path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+        return None;
+    }
+
+    let parent_path = path.parent()?;
+    let name = path.file_name()?;
+    let parent = resolve_relative(start, nodes, parent_path)?;
+    create_node_in_dir(&parent, nodes, name, VfsEntryKind::File, mode)
+}
+
+fn open_resolved_node(
+    existing: Option<Arc<Node>>,
+    create: impl FnOnce() -> Option<Arc<Node>>,
+    flags: i32,
+) -> (RawFd, Option<Arc<Node>>) {
+    if existing.is_some() && flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL
+    {
+        return (-1, None);
+    }
+
+    let node = match existing {
+        Some(node) => node,
+        None if flags & O_CREAT != 0 => {
+            let Some(node) = create() else {
+                return (-1, None);
+            };
+            node
+        }
+        None => return (-1, None),
+    };
+
+    if flags & libc::O_DIRECTORY != 0 && !matches!(node.kind, NodeKind::Directory { .. }) {
+        return (-1, None);
+    }
+
+    let fd = open_backing(node.backing_fd(), flags);
+    if fd < 0 {
+        return (fd, None);
+    }
+    (fd, Some(node))
+}
+
+fn open_node_relative(
+    start: &Arc<Node>,
+    nodes: &NodeMap,
+    path: &Path,
+    flags: i32,
+    mode: mode_t,
+) -> Option<(RawFd, Option<Arc<Node>>)> {
+    if path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+        return None;
+    }
+
+    let existing = resolve_relative(start, nodes, path);
+    Some(open_resolved_node(
+        existing,
+        || create_relative_file(start, nodes, path, mode),
+        flags,
+    ))
 }
 
 fn stat_node(node: &Node, nodes: &NodeMap, statbuf: &mut stat) -> i32 {
