@@ -33,6 +33,7 @@ pub struct MemoryFS {
 struct Node {
     id: NodeId,
     mode: RwLock<mode_t>,
+    links: RwLock<u64>,
     kind: NodeKind,
 }
 
@@ -154,6 +155,7 @@ impl MemoryFS {
         let root = Arc::new(Node {
             id: root_id,
             mode: RwLock::new(0o755),
+            links: RwLock::new(1),
             kind: NodeKind::Directory {
                 entries: RwLock::new(BTreeMap::new()),
                 placeholder_fd: create_memfd(b"sandbox-vfs-dir\0"),
@@ -231,6 +233,35 @@ fn node_from_map(nodes: &NodeMap, id: NodeId) -> Option<Arc<Node>> {
     nodes.read().unwrap().get(&id).cloned()
 }
 
+fn resolve_from_root(path: &Path, nodes: &NodeMap, root: NodeId) -> Option<Arc<Node>> {
+    MemoryFS::assert_absolute(path);
+    let mut node = node_from_map(nodes, root)?;
+
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        let NodeKind::Directory { entries, .. } = &node.kind else {
+            return None;
+        };
+        let child_id = *entries.read().unwrap().get(name)?;
+        node = node_from_map(nodes, child_id)?;
+    }
+    Some(node)
+}
+
+fn resolve_parent_from_root<'a>(
+    path: &'a Path,
+    nodes: &NodeMap,
+    root: NodeId,
+) -> Option<(Arc<Node>, &'a OsStr)> {
+    MemoryFS::assert_absolute(path);
+    Some((
+        resolve_from_root(path.parent()?, nodes, root)?,
+        path.file_name()?,
+    ))
+}
+
 fn create_node_in_dir(
     parent: &Node,
     nodes: &NodeMap,
@@ -264,11 +295,47 @@ fn create_node_in_dir(
     let node = Arc::new(Node {
         id,
         mode: RwLock::new(mode & 0o7777),
+        links: RwLock::new(1),
         kind: node_kind,
     });
     nodes.write().unwrap().insert(id, node.clone());
     entries.insert(name.to_os_string(), id);
     Some(node)
+}
+
+fn remove_node_at(path: &Path, nodes: &NodeMap, root: NodeId, kind: VfsEntryKind) -> i32 {
+    MemoryFS::assert_absolute(path);
+    if path == Path::new("/") {
+        return -1;
+    }
+
+    let Some((parent, name)) = resolve_parent_from_root(path, nodes, root) else {
+        return -1;
+    };
+    let NodeKind::Directory { entries, .. } = &parent.kind else {
+        return -1;
+    };
+
+    let mut entries = entries.write().unwrap();
+    let Some(id) = entries.get(name).copied() else {
+        return -1;
+    };
+    let Some(node) = node_from_map(nodes, id) else {
+        entries.remove(name);
+        return -1;
+    };
+
+    match (&node.kind, kind) {
+        (NodeKind::File { .. }, VfsEntryKind::File) => {}
+        (NodeKind::Directory { entries, .. }, VfsEntryKind::Dir)
+            if entries.read().unwrap().is_empty() => {}
+        _ => return -1,
+    }
+
+    entries.remove(name);
+    *node.links.write().unwrap() = 0;
+    nodes.write().unwrap().remove(&id);
+    0
 }
 
 fn resolve_relative(start: &Arc<Node>, nodes: &NodeMap, path: &Path) -> Option<Arc<Node>> {
@@ -378,18 +445,23 @@ fn stat_node(node: &Node, nodes: &NodeMap, statbuf: &mut stat) -> i32 {
         NodeKind::Directory { .. } => libc::S_IFDIR,
     } | *node.mode.read().unwrap();
     statbuf.st_ino = node.id as _;
-    statbuf.st_nlink = match node.kind {
-        NodeKind::File { .. } => 1,
-        NodeKind::Directory { ref entries, .. } => {
-            2 + entries
-                .read()
-                .unwrap()
-                .values()
-                .filter(|id| {
-                    node_from_map(nodes, **id)
-                        .is_some_and(|node| matches!(node.kind, NodeKind::Directory { .. }))
-                })
-                .count() as libc::nlink_t
+    let links = *node.links.read().unwrap();
+    statbuf.st_nlink = if links == 0 {
+        0
+    } else {
+        match node.kind {
+            NodeKind::File { .. } => 1,
+            NodeKind::Directory { ref entries, .. } => {
+                2 + entries
+                    .read()
+                    .unwrap()
+                    .values()
+                    .filter(|id| {
+                        node_from_map(nodes, **id)
+                            .is_some_and(|node| matches!(node.kind, NodeKind::Directory { .. }))
+                    })
+                    .count() as libc::nlink_t
+            }
         }
     };
     statbuf.st_blksize = 4096;
@@ -452,6 +524,14 @@ impl LowLevelFS for MemoryFS {
             .map_or(-1, |_| 0)
     }
 
+    fn unlink(&self, path: &Path) -> i32 {
+        remove_node_at(path, &self.nodes, self.root, VfsEntryKind::File)
+    }
+
+    fn rmdir(&self, path: &Path) -> i32 {
+        remove_node_at(path, &self.nodes, self.root, VfsEntryKind::Dir)
+    }
+
     fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
         let Some(node) = self.resolve(path) else {
             return -1;
@@ -498,6 +578,40 @@ mod test {
         assert_ne!(fs.open(Path::new("/missing/file"), O_CREAT, 0o644), 0);
         assert_eq!(fs.mkdir(Path::new("/dir"), 0o755), 0);
         assert!(fs.open(Path::new("/dir/file"), O_CREAT, 0o644) > 0);
+    }
+
+    #[test]
+    fn unlink_removes_file_from_namespace() {
+        let fs = MemoryFS::new("memory");
+        assert!(fs.open(Path::new("/file"), O_CREAT, 0o644) > 0);
+
+        assert_eq!(fs.unlink(Path::new("/file")), 0);
+
+        assert_ne!(fs.access(Path::new("/file"), F_OK), 0);
+    }
+
+    #[test]
+    fn unlink_rejects_directories_and_rmdir_rejects_files() {
+        let fs = MemoryFS::new("memory");
+        assert!(fs.open(Path::new("/file"), O_CREAT, 0o644) > 0);
+        assert_eq!(fs.mkdir(Path::new("/dir"), 0o755), 0);
+
+        assert_ne!(fs.unlink(Path::new("/dir")), 0);
+        assert_ne!(fs.rmdir(Path::new("/file")), 0);
+        assert_eq!(fs.access(Path::new("/dir"), F_OK), 0);
+        assert_eq!(fs.access(Path::new("/file"), F_OK), 0);
+    }
+
+    #[test]
+    fn rmdir_only_removes_empty_directories() {
+        let fs = MemoryFS::new("memory");
+        assert_eq!(fs.mkdir(Path::new("/dir"), 0o755), 0);
+        assert!(fs.open(Path::new("/dir/file"), O_CREAT, 0o644) > 0);
+
+        assert_ne!(fs.rmdir(Path::new("/dir")), 0);
+        assert_eq!(fs.unlink(Path::new("/dir/file")), 0);
+        assert_eq!(fs.rmdir(Path::new("/dir")), 0);
+        assert_ne!(fs.access(Path::new("/dir"), F_OK), 0);
     }
 
     #[test]

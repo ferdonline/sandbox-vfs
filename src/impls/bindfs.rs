@@ -98,6 +98,30 @@ impl LowLevelFS for BindFS {
         }
     }
 
+    fn unlink(&self, pth: &Path) -> i32 {
+        let final_path = self.translate_c_path(pth);
+        #[cfg(all(target_os = "linux", feature = "hooks"))]
+        unsafe {
+            libc_hooks::unlink::call_orig(final_path.as_cstr())
+        }
+        #[cfg(any(not(target_os = "linux"), not(feature = "hooks")))]
+        unsafe {
+            libc::unlink(final_path.as_cstr())
+        }
+    }
+
+    fn rmdir(&self, pth: &Path) -> i32 {
+        let final_path = self.translate_c_path(pth);
+        #[cfg(all(target_os = "linux", feature = "hooks"))]
+        unsafe {
+            libc_hooks::rmdir::call_orig(final_path.as_cstr())
+        }
+        #[cfg(any(not(target_os = "linux"), not(feature = "hooks")))]
+        unsafe {
+            libc::rmdir(final_path.as_cstr())
+        }
+    }
+
     fn chmod(&self, pth: &Path, mode: mode_t) -> i32 {
         let final_path = self.translate_c_path(pth);
         #[cfg(all(target_os = "linux", feature = "hooks"))]

@@ -207,6 +207,21 @@ dlhooks::hook! {
     }
 }
 dlhooks::hook! {
+    unsafe fn unlink(path: *const c_char) -> c_int => {
+        VFS.unlink(Path::from_cstr(path))
+    }
+}
+dlhooks::hook! {
+    unsafe fn rmdir(path: *const c_char) -> c_int => {
+        VFS.rmdir(Path::from_cstr(path))
+    }
+}
+dlhooks::hook! {
+    unsafe fn unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int => {
+        VFS.unlinkat(dirfd, Path::from_cstr(pathname), flags)
+    }
+}
+dlhooks::hook! {
     unsafe fn getdents64(fd: c_int, dirp: *mut c_void, count: c_int) -> isize => {
         match VFS.getdents64(fd, dirp, count) {
             Some(result) => result,

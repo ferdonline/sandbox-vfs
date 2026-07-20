@@ -203,6 +203,19 @@ impl RootVFS {
         fs.mkdir(&backend_path, mode)
     }
 
+    pub fn unlinkat(&self, dirfd: i32, path: &Path, flags: i32) -> i32 {
+        let Some(virtual_path) = self.resolve_openat_path(dirfd, path) else {
+            return -1;
+        };
+
+        let (fs, backend_path) = self.absolute_path_to_fs(virtual_path);
+        if flags & libc::AT_REMOVEDIR != 0 {
+            fs.rmdir(&backend_path)
+        } else {
+            fs.unlink(&backend_path)
+        }
+    }
+
     pub fn fstat(&self, fd: i32, statbuf: &mut stat) -> Option<i32> {
         let opened = {
             let fds = self.fds.read().unwrap();
@@ -285,6 +298,16 @@ impl LowLevelFS for RootVFS {
     fn mkdir(&self, path: &Path, mode: mode_t) -> i32 {
         let (fs, path) = self.path_to_fs(path);
         fs.mkdir(&path, mode)
+    }
+
+    fn unlink(&self, path: &Path) -> i32 {
+        let (fs, path) = self.path_to_fs(path);
+        fs.unlink(&path)
+    }
+
+    fn rmdir(&self, path: &Path) -> i32 {
+        let (fs, path) = self.path_to_fs(path);
+        fs.rmdir(&path)
     }
 
     fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
@@ -505,6 +528,22 @@ mod test {
         let mut actual = unsafe { std::mem::zeroed() };
         assert_eq!(root.fstat(fd, &mut actual), Some(0));
         assert_eq!(actual.st_ino, expected.st_ino);
+    }
+
+    #[test]
+    fn test_fstat_keeps_open_unlinked_memory_file_alive() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        let fd = root.open(Path::new("/file.txt"), O_CREAT, 0o644);
+        let mut before = unsafe { std::mem::zeroed() };
+        assert_eq!(root.fstat(fd, &mut before), Some(0));
+
+        assert_eq!(root.unlink(Path::new("/file.txt")), 0);
+        assert_ne!(root.access(Path::new("/file.txt"), F_OK), 0);
+
+        let mut after = unsafe { std::mem::zeroed() };
+        assert_eq!(root.fstat(fd, &mut after), Some(0));
+        assert_eq!(after.st_ino, before.st_ino);
+        assert_eq!(after.st_nlink, 0);
     }
 
     #[test]

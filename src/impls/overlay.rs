@@ -128,6 +128,22 @@ impl LowLevelFS for OverlayFS {
         self.top.mkdir(path, mode)
     }
 
+    fn unlink(&self, path: &Path) -> i32 {
+        if self.top.access(path, F_OK) == 0 {
+            return self.top.unlink(path);
+        }
+
+        self.visible_layer(path).unlink(path)
+    }
+
+    fn rmdir(&self, path: &Path) -> i32 {
+        if self.top.access(path, F_OK) == 0 {
+            return self.top.rmdir(path);
+        }
+
+        self.visible_layer(path).rmdir(path)
+    }
+
     fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
         self.visible_layer(path).chmod(path, mode)
     }

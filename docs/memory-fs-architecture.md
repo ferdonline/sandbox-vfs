@@ -130,9 +130,9 @@ backend-owned handle instead.
 
 For `MemoryFS`, the handle retains an `Arc` to the opened node. It therefore
 continues to identify the same node even if its original path becomes stale.
-When unlink support is added, this will allow an unlinked node to remain usable
-through existing open descriptors until the final reference is closed,
-matching normal Unix filesystem behavior.
+After `unlink()` removes a file from the namespace, existing open descriptors
+continue to keep the node usable until the final reference is closed, matching
+normal Unix filesystem behavior.
 
 Backends that rely entirely on real kernel descriptors do not need to provide a
 virtual opened-file handle.

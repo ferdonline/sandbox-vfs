@@ -67,6 +67,8 @@ pub trait LowLevelFS: Debug + Sync + Send + 'static {
     fn open(&self, path: &Path, flag: i32, mode: mode_t) -> i32;
     fn openat(&self, dirfd: i32, path: &Path, flag: i32, mode: mode_t) -> i32;
     fn mkdir(&self, path: &Path, mode: mode_t) -> i32;
+    fn unlink(&self, path: &Path) -> i32;
+    fn rmdir(&self, path: &Path) -> i32;
     fn chmod(&self, path: &Path, mode: mode_t) -> i32;
     fn stat(&self, path: &Path, statbuf: &mut stat) -> i32;
 
