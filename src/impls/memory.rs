@@ -338,6 +338,118 @@ fn remove_node_at(path: &Path, nodes: &NodeMap, root: NodeId, kind: VfsEntryKind
     0
 }
 
+fn rename_node_at(old_path: &Path, new_path: &Path, nodes: &NodeMap, root: NodeId) -> i32 {
+    MemoryFS::assert_absolute(old_path);
+    MemoryFS::assert_absolute(new_path);
+    if old_path == Path::new("/") || new_path == Path::new("/") {
+        return -1;
+    }
+    if old_path == new_path {
+        return 0;
+    }
+
+    let Some((old_parent, old_name)) = resolve_parent_from_root(old_path, nodes, root) else {
+        return -1;
+    };
+    let Some((new_parent, new_name)) = resolve_parent_from_root(new_path, nodes, root) else {
+        return -1;
+    };
+
+    let NodeKind::Directory {
+        entries: old_entries,
+        ..
+    } = &old_parent.kind
+    else {
+        return -1;
+    };
+    let NodeKind::Directory {
+        entries: new_entries,
+        ..
+    } = &new_parent.kind
+    else {
+        return -1;
+    };
+
+    if old_parent.id == new_parent.id {
+        let mut entries = old_entries.write().unwrap();
+        let Some(old_id) = entries.get(old_name).copied() else {
+            return -1;
+        };
+        let Some(node) = node_from_map(nodes, old_id) else {
+            return -1;
+        };
+        if matches!(node.kind, NodeKind::Directory { .. }) && new_path.starts_with(old_path) {
+            return -1;
+        }
+        if entries.get(new_name).copied() == Some(old_id) {
+            return 0;
+        }
+        if let Some(replaced_id) = entries.get(new_name).copied() {
+            let Some(replaced) = node_from_map(nodes, replaced_id) else {
+                return -1;
+            };
+            if !can_replace_node(&node, &replaced) {
+                return -1;
+            }
+            *replaced.links.write().unwrap() = 0;
+            nodes.write().unwrap().remove(&replaced_id);
+        }
+        entries.remove(old_name);
+        entries.insert(new_name.to_os_string(), old_id);
+        return 0;
+    }
+
+    let old_id = {
+        let entries = old_entries.read().unwrap();
+        let Some(old_id) = entries.get(old_name).copied() else {
+            return -1;
+        };
+        old_id
+    };
+    let Some(node) = node_from_map(nodes, old_id) else {
+        return -1;
+    };
+    if matches!(node.kind, NodeKind::Directory { .. }) && new_path.starts_with(old_path) {
+        return -1;
+    }
+
+    let replaced_id = {
+        let entries = new_entries.read().unwrap();
+        entries.get(new_name).copied()
+    };
+    if let Some(replaced_id) = replaced_id {
+        if replaced_id == old_id {
+            return 0;
+        }
+        let Some(replaced) = node_from_map(nodes, replaced_id) else {
+            return -1;
+        };
+        if !can_replace_node(&node, &replaced) {
+            return -1;
+        }
+    }
+
+    old_entries.write().unwrap().remove(old_name);
+    let mut entries = new_entries.write().unwrap();
+    if let Some(replaced_id) = entries.insert(new_name.to_os_string(), old_id) {
+        if let Some(replaced) = node_from_map(nodes, replaced_id) {
+            *replaced.links.write().unwrap() = 0;
+        }
+        nodes.write().unwrap().remove(&replaced_id);
+    }
+    0
+}
+
+fn can_replace_node(source: &Node, destination: &Node) -> bool {
+    match (&source.kind, &destination.kind) {
+        (NodeKind::File { .. }, NodeKind::File { .. }) => true,
+        (NodeKind::Directory { .. }, NodeKind::Directory { entries, .. }) => {
+            entries.read().unwrap().is_empty()
+        }
+        _ => false,
+    }
+}
+
 fn resolve_relative(start: &Arc<Node>, nodes: &NodeMap, path: &Path) -> Option<Arc<Node>> {
     if !can_resolve_relative_to_opened_node(path) {
         return None;
@@ -532,6 +644,10 @@ impl LowLevelFS for MemoryFS {
         remove_node_at(path, &self.nodes, self.root, VfsEntryKind::Dir)
     }
 
+    fn rename(&self, old_path: &Path, new_path: &Path) -> i32 {
+        rename_node_at(old_path, new_path, &self.nodes, self.root)
+    }
+
     fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
         let Some(node) = self.resolve(path) else {
             return -1;
@@ -612,6 +728,50 @@ mod test {
         assert_eq!(fs.unlink(Path::new("/dir/file")), 0);
         assert_eq!(fs.rmdir(Path::new("/dir")), 0);
         assert_ne!(fs.access(Path::new("/dir"), F_OK), 0);
+    }
+
+    #[test]
+    fn rename_moves_file_entry_without_replacing_node() {
+        let fs = MemoryFS::new("memory");
+        assert!(fs.open(Path::new("/old"), O_CREAT, 0o644) > 0);
+        let mut before = unsafe { std::mem::zeroed() };
+        assert_eq!(fs.stat(Path::new("/old"), &mut before), 0);
+
+        assert_eq!(fs.rename(Path::new("/old"), Path::new("/new")), 0);
+
+        assert_ne!(fs.access(Path::new("/old"), F_OK), 0);
+        assert_eq!(fs.access(Path::new("/new"), F_OK), 0);
+        let mut after = unsafe { std::mem::zeroed() };
+        assert_eq!(fs.stat(Path::new("/new"), &mut after), 0);
+        assert_eq!(after.st_ino, before.st_ino);
+    }
+
+    #[test]
+    fn rename_replaces_existing_file() {
+        let fs = MemoryFS::new("memory");
+        assert!(fs.open(Path::new("/old"), O_CREAT, 0o644) > 0);
+        assert!(fs.open(Path::new("/new"), O_CREAT, 0o644) > 0);
+        let mut before = unsafe { std::mem::zeroed() };
+        assert_eq!(fs.stat(Path::new("/old"), &mut before), 0);
+
+        assert_eq!(fs.rename(Path::new("/old"), Path::new("/new")), 0);
+
+        let mut after = unsafe { std::mem::zeroed() };
+        assert_eq!(fs.stat(Path::new("/new"), &mut after), 0);
+        assert_eq!(after.st_ino, before.st_ino);
+    }
+
+    #[test]
+    fn rename_rejects_type_mismatches_and_nonempty_directory_replacement() {
+        let fs = MemoryFS::new("memory");
+        assert!(fs.open(Path::new("/file"), O_CREAT, 0o644) > 0);
+        assert_eq!(fs.mkdir(Path::new("/dir"), 0o755), 0);
+        assert_eq!(fs.mkdir(Path::new("/nonempty"), 0o755), 0);
+        assert!(fs.open(Path::new("/nonempty/file"), O_CREAT, 0o644) > 0);
+
+        assert_ne!(fs.rename(Path::new("/file"), Path::new("/dir")), 0);
+        assert_ne!(fs.rename(Path::new("/dir"), Path::new("/file")), 0);
+        assert_ne!(fs.rename(Path::new("/dir"), Path::new("/nonempty")), 0);
     }
 
     #[test]

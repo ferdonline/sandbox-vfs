@@ -222,6 +222,41 @@ dlhooks::hook! {
     }
 }
 dlhooks::hook! {
+    unsafe fn rename(oldpath: *const c_char, newpath: *const c_char) -> c_int => {
+        VFS.rename(Path::from_cstr(oldpath), Path::from_cstr(newpath))
+    }
+}
+dlhooks::hook! {
+    unsafe fn renameat(olddirfd: c_int, oldpath: *const c_char, newdirfd: c_int, newpath: *const c_char) -> c_int => {
+        VFS.renameat(
+            olddirfd,
+            Path::from_cstr(oldpath),
+            newdirfd,
+            Path::from_cstr(newpath),
+        )
+    }
+}
+dlhooks::hook! {
+    unsafe fn renameat2(
+        olddirfd: c_int,
+        oldpath: *const c_char,
+        newdirfd: c_int,
+        newpath: *const c_char,
+        flags: libc::c_uint
+    ) -> c_int => {
+        if flags == 0 {
+            VFS.renameat(
+                olddirfd,
+                Path::from_cstr(oldpath),
+                newdirfd,
+                Path::from_cstr(newpath),
+            )
+        } else {
+            Self::call_orig(olddirfd, oldpath, newdirfd, newpath, flags)
+        }
+    }
+}
+dlhooks::hook! {
     unsafe fn getdents64(fd: c_int, dirp: *mut c_void, count: c_int) -> isize => {
         match VFS.getdents64(fd, dirp, count) {
             Some(result) => result,

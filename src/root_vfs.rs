@@ -216,6 +216,29 @@ impl RootVFS {
         }
     }
 
+    pub fn renameat(
+        &self,
+        old_dirfd: i32,
+        old_path: &Path,
+        new_dirfd: i32,
+        new_path: &Path,
+    ) -> i32 {
+        let Some(old_virtual_path) = self.resolve_openat_path(old_dirfd, old_path) else {
+            return -1;
+        };
+        let Some(new_virtual_path) = self.resolve_openat_path(new_dirfd, new_path) else {
+            return -1;
+        };
+
+        let (old_fs, old_backend_path) = self.absolute_path_to_fs(old_virtual_path);
+        let (new_fs, new_backend_path) = self.absolute_path_to_fs(new_virtual_path);
+        if !std::ptr::eq(old_fs, new_fs) {
+            return -1;
+        }
+
+        old_fs.rename(&old_backend_path, &new_backend_path)
+    }
+
     pub fn fstat(&self, fd: i32, statbuf: &mut stat) -> Option<i32> {
         let opened = {
             let fds = self.fds.read().unwrap();
@@ -308,6 +331,10 @@ impl LowLevelFS for RootVFS {
     fn rmdir(&self, path: &Path) -> i32 {
         let (fs, path) = self.path_to_fs(path);
         fs.rmdir(&path)
+    }
+
+    fn rename(&self, old_path: &Path, new_path: &Path) -> i32 {
+        self.renameat(AT_FDCWD, old_path, AT_FDCWD, new_path)
     }
 
     fn chmod(&self, path: &Path, mode: mode_t) -> i32 {
@@ -544,6 +571,42 @@ mod test {
         assert_eq!(root.fstat(fd, &mut after), Some(0));
         assert_eq!(after.st_ino, before.st_ino);
         assert_eq!(after.st_nlink, 0);
+    }
+
+    #[test]
+    fn test_fstat_keeps_open_renamed_memory_file_identity() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        let fd = root.open(Path::new("/old.txt"), O_CREAT, 0o644);
+        let mut before = unsafe { std::mem::zeroed() };
+        assert_eq!(root.fstat(fd, &mut before), Some(0));
+
+        assert_eq!(root.rename(Path::new("/old.txt"), Path::new("/new.txt")), 0);
+        assert_ne!(root.access(Path::new("/old.txt"), F_OK), 0);
+        assert_eq!(root.access(Path::new("/new.txt"), F_OK), 0);
+
+        let mut after = unsafe { std::mem::zeroed() };
+        assert_eq!(root.fstat(fd, &mut after), Some(0));
+        assert_eq!(after.st_ino, before.st_ino);
+        assert_eq!(after.st_nlink, 1);
+    }
+
+    #[test]
+    fn test_renameat_resolves_relative_paths() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+        assert!(root.open(Path::new("/work/old.txt"), O_CREAT, 0o644) > 0);
+        root.set_cwd("/work");
+
+        assert_eq!(
+            root.renameat(
+                libc::AT_FDCWD,
+                Path::new("old.txt"),
+                libc::AT_FDCWD,
+                Path::new("new.txt"),
+            ),
+            0
+        );
+        assert_eq!(root.access(Path::new("/work/new.txt"), F_OK), 0);
     }
 
     #[test]

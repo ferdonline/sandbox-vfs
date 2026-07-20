@@ -122,6 +122,19 @@ impl LowLevelFS for BindFS {
         }
     }
 
+    fn rename(&self, old_path: &Path, new_path: &Path) -> i32 {
+        let final_old_path = self.translate_c_path(old_path);
+        let final_new_path = self.translate_c_path(new_path);
+        #[cfg(all(target_os = "linux", feature = "hooks"))]
+        unsafe {
+            libc_hooks::rename::call_orig(final_old_path.as_cstr(), final_new_path.as_cstr())
+        }
+        #[cfg(any(not(target_os = "linux"), not(feature = "hooks")))]
+        unsafe {
+            libc::rename(final_old_path.as_cstr(), final_new_path.as_cstr())
+        }
+    }
+
     fn chmod(&self, pth: &Path, mode: mode_t) -> i32 {
         let final_path = self.translate_c_path(pth);
         #[cfg(all(target_os = "linux", feature = "hooks"))]

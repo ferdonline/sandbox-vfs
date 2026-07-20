@@ -49,8 +49,8 @@ Node IDs are process-global and stable for the lifetime of their node. This
 allows `stat()` and directory entries returned by `getdents64()` to report the
 same inode number.
 
-This representation also provides the foundation for rename, unlink, and hard
-links: those operations change directory entries without replacing the node.
+This representation lets rename and unlink change directory entries without
+replacing the node. It also provides the foundation for hard links.
 
 ## Kernel-Backed Regular Files
 
