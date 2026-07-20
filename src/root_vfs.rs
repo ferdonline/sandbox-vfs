@@ -136,6 +136,18 @@ impl RootVFS {
         self.fds.write().unwrap().remove(&fd);
     }
 
+    pub fn clone_fd(&self, oldfd: i32, newfd: i32) {
+        let mut fds = self.fds.write().unwrap();
+        match fds.get(&oldfd).cloned() {
+            Some(info) => {
+                fds.insert(newfd, info);
+            }
+            None => {
+                fds.remove(&newfd);
+            }
+        }
+    }
+
     pub fn resolve_at(&self, dirfd: i32, path: &Path) -> Option<PathBuf> {
         self.resolve_openat_path(dirfd, path)
     }
@@ -452,6 +464,33 @@ mod test {
         root.forget_fd(dirfd);
 
         assert_ne!(root.openat(dirfd, Path::new("out.txt"), O_CREAT, 0o644), 0);
+    }
+
+    #[test]
+    fn test_clone_fd_preserves_openat_base() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+
+        let dirfd = root.open(Path::new("/work"), O_RDONLY, 0);
+        let cloned = 1234;
+        root.clone_fd(dirfd, cloned);
+        root.forget_fd(dirfd);
+
+        assert!(root.openat(cloned, Path::new("out.txt"), O_CREAT, 0o644) > 0);
+        assert_eq!(root.access(Path::new("/work/out.txt"), F_OK), 0);
+    }
+
+    #[test]
+    fn test_clone_fd_from_untracked_fd_clears_reused_target() {
+        let root = RootVFS::new(MemoryFS::new("root"));
+        root.mkdir(Path::new("/work"), 0o755);
+
+        let dirfd = root.open(Path::new("/work"), O_RDONLY, 0);
+        let reused = 1234;
+        root.clone_fd(dirfd, reused);
+        root.clone_fd(5678, reused);
+
+        assert_ne!(root.openat(reused, Path::new("out.txt"), O_CREAT, 0o644), 0);
     }
 
     #[test]
